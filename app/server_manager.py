@@ -5,6 +5,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urljoin
 from pathlib import Path
 
 import psutil
@@ -64,3 +65,15 @@ def wait_for_http(port: int, timeout_seconds: int = 30) -> bool:
             time.sleep(1)
     return False
 
+
+def wait_for_static_file(port: int, static_url: str, timeout_seconds: int = 30) -> bool:
+    deadline = time.time() + timeout_seconds
+    url = urljoin(f"http://127.0.0.1:{port}/", static_url)
+    while time.time() < deadline:
+        try:
+            request = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(request, timeout=3) as response:
+                return 200 <= response.status < 400 and int(response.headers.get("Content-Length", "1")) > 0
+        except (OSError, urllib.error.URLError, urllib.error.HTTPError):
+            time.sleep(1)
+    return False

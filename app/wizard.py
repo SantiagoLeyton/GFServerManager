@@ -15,11 +15,11 @@ from .database_manager import (
     check_connection,
     ensure_database,
 )
-from .django_manager import collectstatic, ensure_virtualenv, install_dependencies, migrate
+from .django_manager import collectstatic, ensure_virtualenv, find_static_probe_url, install_dependencies, migrate
 from .environment_manager import build_env_values, write_env
 from .project_validator import validate_project
 from .requirements_checker import check_requirements
-from .server_manager import start_waitress, wait_for_http
+from .server_manager import start_waitress, wait_for_http, wait_for_static_file
 from .user_manager import InitialUser, create_or_update_initial_users
 
 
@@ -111,15 +111,15 @@ class InstallWizard(ttk.Frame):
         ).grid(row=1, column=0, columnspan=2, sticky="w")
 
         fields = [
-            ("Host", self.db_host, False),
-            ("Puerto", self.db_port, False),
-            ("Base de datos", self.db_name, False),
-            ("Usuario/owner", self.db_user, False),
-            ("Contrasena usuario/owner", self.db_password, True),
-            ("Admin PostgreSQL", self.admin_user, False),
-            ("Contrasena admin", self.admin_password, True),
-            ("Owner a crear/usar", self.owner_user, False),
-            ("Contrasena owner", self.owner_password, True),
+            ("Host (DB_HOST)", self.db_host, False),
+            ("Puerto (DB_PORT)", self.db_port, False),
+            ("Base de datos (DB_NAME)", self.db_name, False),
+            ("Usuario de la base de datos (DB_USER)", self.db_user, False),
+            ("Contraseña de la base de datos (DB_PASSWORD)", self.db_password, True),
+            ("Administrador PostgreSQL", self.admin_user, False),
+            ("Contraseña del administrador", self.admin_password, True),
+            ("Nuevo usuario (Owner)", self.owner_user, False),
+            ("Contraseña del nuevo usuario", self.owner_password, True),
         ]
         for index, (label, variable, secret) in enumerate(fields, start=2):
             ttk.Label(self.database_tab, text=label).grid(row=index, column=0, sticky="w", pady=4)
@@ -278,6 +278,7 @@ class InstallWizard(ttk.Frame):
             migrate(project_path, venv)
             self._log("Recolectando archivos estaticos...")
             collectstatic(project_path, venv)
+            static_probe_url = find_static_probe_url(project_path, venv)
             self._log("Creando o actualizando usuarios iniciales...")
             user_output = create_or_update_initial_users(
                 project_path,
@@ -293,6 +294,9 @@ class InstallWizard(ttk.Frame):
             self._log("Verificando respuesta HTTP local...")
             if not wait_for_http(port):
                 raise RuntimeError("Waitress inicio, pero la aplicacion no respondio en el tiempo esperado.")
+            self._log("Verificando archivo estatico real...")
+            if not wait_for_static_file(port, static_probe_url):
+                raise RuntimeError("La aplicacion respondio, pero no se pudo servir un archivo estatico real.")
 
             config = build_config(project_path, venv, port, pid=process.pid)
             save_config(config)

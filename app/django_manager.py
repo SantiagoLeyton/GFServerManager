@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import json
 from pathlib import Path
 
 
@@ -18,26 +19,25 @@ def ensure_virtualenv(project_path: Path) -> Path:
     executable = python_executable(venv)
     if executable.exists():
         return venv
-    subprocess.run([sys.executable, "-m", "venv", str(venv)], cwd=project_path, check=True)
+    _run([sys.executable, "-m", "venv", str(venv)], project_path)
     return venv
 
 
 def install_dependencies(project_path: Path, venv: Path) -> None:
     python = python_executable(venv)
-    subprocess.run([str(python), "-m", "pip", "install", "--upgrade", "pip"], cwd=project_path, check=True)
-    subprocess.run([str(python), "-m", "pip", "install", "-r", "requirements.txt"], cwd=project_path, check=True)
-    subprocess.run([str(python), "-m", "pip", "install", "waitress"], cwd=project_path, check=True)
+    _run([str(python), "-m", "pip", "install", "--upgrade", "pip"], project_path)
+    _run([str(python), "-m", "pip", "install", "-r", "requirements.txt"], project_path)
+    _run([str(python), "-m", "pip", "install", "waitress"], project_path)
 
 
 def migrate(project_path: Path, venv: Path) -> None:
-    subprocess.run([str(python_executable(venv)), "manage.py", "migrate", "--noinput"], cwd=project_path, check=True)
+    _run([str(python_executable(venv)), "manage.py", "migrate", "--noinput"], project_path)
 
 
 def collectstatic(project_path: Path, venv: Path) -> None:
-    subprocess.run(
+    _run(
         [str(python_executable(venv)), "manage.py", "collectstatic", "--noinput"],
-        cwd=project_path,
-        check=True,
+        project_path,
     )
 
 def django_shell(project_path: Path, venv: Path, code: str, input_text: str | None = None) -> subprocess.CompletedProcess:
@@ -50,3 +50,43 @@ def django_shell(project_path: Path, venv: Path, code: str, input_text: str | No
         check=True,
     )
 
+
+def find_static_probe_url(project_path: Path, venv: Path) -> str:
+    code = r"""
+import json
+from pathlib import Path
+from django.conf import settings
+
+static_root = Path(settings.STATIC_ROOT)
+preferred_suffixes = [".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".ico"]
+files = [
+    path for path in static_root.rglob("*")
+    if path.is_file() and path.suffix not in {".gz", ".br", ".json"}
+]
+chosen = None
+for suffix in preferred_suffixes:
+    chosen = next((path for path in files if path.suffix.lower() == suffix), None)
+    if chosen:
+        break
+if not chosen and files:
+    chosen = files[0]
+if not chosen:
+    raise SystemExit("No se encontro ningun archivo en STATIC_ROOT despues de collectstatic.")
+relative = chosen.relative_to(static_root).as_posix()
+static_url = settings.STATIC_URL
+if not static_url.endswith("/"):
+    static_url += "/"
+print(json.dumps({"url": static_url + relative, "relative": relative}))
+"""
+    result = django_shell(project_path, venv, code)
+    data = json.loads(result.stdout.strip().splitlines()[-1])
+    return data["url"]
+
+
+def _run(command: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    result = subprocess.run(command, cwd=cwd, text=True, capture_output=True)
+    if result.returncode != 0:
+        output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+        command_text = " ".join(command)
+        raise RuntimeError(f"Fallo el comando: {command_text}\n{output}")
+    return result
