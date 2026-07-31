@@ -1,49 +1,83 @@
 # Gestion Fiduciaria Server Manager
 
-Aplicacion de escritorio para Windows que guia la instalacion inicial de Gestion Fiduciaria en el servidor interno.
+Aplicacion de escritorio para Windows que instala y administra localmente el servidor de Gestion Fiduciaria.
 
-## Fase 1
+Version oficial: `1.0.0`.
 
-Incluye solamente el asistente de instalacion inicial:
-
-- valida que la carpeta seleccionada sea el proyecto Gestion Fiduciaria esperado;
-- comprueba o crea la base de datos PostgreSQL sin eliminar roles ni bases;
-- genera `.env` con las variables reales del proyecto Django;
-- prepara `.venv`, instala dependencias, ejecuta migraciones y `collectstatic`;
-- crea las cuentas iniciales de Contabilidad y Comercial usando `get_user_model()`;
-- inicia Waitress en `0.0.0.0` y verifica `http://127.0.0.1:PUERTO/`;
-- guarda configuracion no sensible en `data/server_manager.json`;
-- escribe registros en `logs/server_manager.log` sin credenciales.
-
-No incluye instalador, empaquetado, autoarranque, firewall automatico, copias de seguridad ni actualizacion automatica.
-
-## Fase 2
-
-Cuando existe una instalacion valida en `data/server_manager.json`, la aplicacion abre directamente el panel de administracion diario.
-
-El panel incluye:
-
-- Inicio con estado general y acciones rapidas.
-- Servidor con PID, puerto, tiempo de ejecucion e inicio/detencion/reinicio de Waitress.
-- Base de datos en modo consulta y prueba de conexion.
-- Usuarios con lectura desde Django, creacion, cambio de contrasena y activacion/inactivacion.
-- Configuracion local con edicion limitada de host y puerto.
-- Logs con lectura automatica de `logs/server_manager.log`.
-
-Cerrar la ventana no detiene Waitress automaticamente. Si el servidor esta activo, se pregunta si se desea mantenerlo en segundo plano, detenerlo o cancelar la salida.
-
-## Uso
-
-Instalar dependencias del Server Manager:
+## Ejecucion en desarrollo
 
 ```powershell
 python -m pip install -r requirements.txt
-```
-
-Ejecutar:
-
-```powershell
 python main.py
 ```
 
-El puerto predeterminado es `8000`. Para acceso desde otros equipos, el Firewall de Windows debe permitir conexiones entrantes a ese puerto.
+El punto de entrada unico es `main.py`.
+
+## Datos persistentes
+
+La aplicacion guarda datos modificables fuera del directorio de instalacion:
+
+```text
+%LOCALAPPDATA%\ConstructoraCentenario\GFServerManager
+```
+
+Alli se almacenan:
+
+- `data\server_manager.json`
+- `logs\server_manager.log`
+- diagnosticos exportados
+
+Si existen datos antiguos en `data\` o `logs\` dentro del repositorio, se migran de forma segura cuando no exista ya el archivo equivalente en LocalAppData.
+
+## Compilacion
+
+Requisitos del equipo de compilacion:
+
+- Windows
+- Python compatible con el proyecto
+- Acceso a internet o cache local de paquetes pip
+
+Generar la distribucion onedir:
+
+```powershell
+.\build.ps1 -SkipInstaller
+```
+
+El ejecutable queda en:
+
+```text
+dist\GFServerManager\GFServerManager.exe
+```
+
+## Instalador
+
+Para generar tambien el instalador, instale Inno Setup 6 y asegure que `ISCC.exe` este en el `PATH` o en su ruta predeterminada.
+
+```powershell
+.\build.ps1
+```
+
+El instalador queda en:
+
+```text
+installer-output\GFServerManager-Setup-1.0.0.exe
+```
+
+Si Inno Setup no esta disponible, el script genera el ejecutable y muestra el paso externo pendiente.
+
+## Actualizacion
+
+Para actualizar una instalacion existente:
+
+1. Cierre GFServerManager.
+2. Ejecute el nuevo instalador.
+3. Instale sobre la misma ruta.
+
+El instalador no elimina la configuracion ni los logs del usuario ubicados en `%LOCALAPPDATA%`.
+
+## Notas de empaquetado
+
+- PyInstaller usa `GFServerManager.spec`.
+- La version del producto vive en `app\metadata.py`.
+- El icono esperado es `assets\app.ico`; si no existe, la aplicacion compila sin inventar recursos graficos.
+- No se empaquetan `.env`, `server_manager.json`, logs, bases de datos, `.venv` ni el proyecto Django `PagosFiducia`.

@@ -14,7 +14,7 @@ from .database_manager import test_connection
 from .diagnostics import DiagnosticReport, export_diagnostics, level_icon, run_diagnostics
 from .django_manager import find_static_probe_url
 from .environment_manager import env_database_credentials, is_env_valid, read_env
-from .logging_config import app_root
+from .logging_config import logs_dir
 from .metadata import APP_AUTHOR, APP_DESCRIPTION, APP_LICENSE, APP_TECHNOLOGIES, APP_VERSION, APP_YEAR, PRODUCT_NAME
 from .project_validator import validate_project
 from .server_manager import (
@@ -272,7 +272,7 @@ class AdminPanel(ttk.Frame):
             ("Detener servidor", self._stop_server),
             ("Iniciar servidor", self._start_server),
             ("Abrir carpeta del proyecto", lambda: self._open_folder(self.project_path)),
-            ("Abrir carpeta de logs", lambda: self._open_folder(app_root() / "logs")),
+            ("Abrir carpeta de logs", lambda: self._open_folder(logs_dir())),
         ]
         for index, (text, command) in enumerate(buttons):
             button = ttk.Button(actions, text=text, command=command)
@@ -391,7 +391,7 @@ class AdminPanel(ttk.Frame):
         parent.columnconfigure(0, weight=1)
         self.logs_text = scrolledtext.ScrolledText(parent, wrap="word")
         self.logs_text.grid(row=0, column=0, sticky="nsew")
-        logs_button = ttk.Button(parent, text="Abrir carpeta de logs", command=lambda: self._open_folder(app_root() / "logs"))
+        logs_button = ttk.Button(parent, text="Abrir carpeta de logs", command=lambda: self._open_folder(logs_dir()))
         logs_button.grid(
             row=1, column=0, sticky="w", pady=(12, 0)
         )
@@ -725,7 +725,7 @@ class AdminPanel(ttk.Frame):
     def _refresh_logs(self) -> None:
         if not self._widget_exists(self.logs_text):
             return
-        log_path = app_root() / "logs" / "server_manager.log"
+        log_path = logs_dir() / "server_manager.log"
         try:
             content = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
         except Exception:

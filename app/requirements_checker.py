@@ -22,23 +22,31 @@ def check_requirements() -> RequirementStatus:
     else:
         messages.append(f"Python detectado: {sys.version.split()[0]}")
 
-    if shutil.which("python") is None:
+    python = _python_for_external_tools()
+    if python is None:
         ok = False
         messages.append("No se encontro python en PATH.")
 
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "venv", "--help"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
+    if python:
+        try:
+            result = subprocess.run(
+                [python, "-m", "venv", "--help"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                ok = False
+                messages.append("El modulo venv no esta disponible.")
+        except (OSError, subprocess.SubprocessError):
             ok = False
-            messages.append("El modulo venv no esta disponible.")
-    except (OSError, subprocess.SubprocessError):
-        ok = False
-        messages.append("No se pudo comprobar el modulo venv.")
+            messages.append("No se pudo comprobar el modulo venv.")
 
     return RequirementStatus(ok=ok, messages=messages)
+
+
+def _python_for_external_tools() -> str | None:
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+    return shutil.which("python")
 

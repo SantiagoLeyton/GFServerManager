@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import json
+import shutil
 from pathlib import Path
 
 
@@ -19,7 +20,7 @@ def ensure_virtualenv(project_path: Path) -> Path:
     executable = python_executable(venv)
     if executable.exists():
         return venv
-    _run([sys.executable, "-m", "venv", str(venv)], project_path)
+    _run([_python_for_external_tools(), "-m", "venv", str(venv)], project_path)
     return venv
 
 
@@ -90,3 +91,12 @@ def _run(command: list[str], cwd: Path) -> subprocess.CompletedProcess:
         command_text = " ".join(command)
         raise RuntimeError(f"Fallo el comando: {command_text}\n{output}")
     return result
+
+
+def _python_for_external_tools() -> str:
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+    python = shutil.which("python")
+    if python:
+        return python
+    raise RuntimeError("No se encontro python en PATH para crear el entorno virtual del proyecto Django.")

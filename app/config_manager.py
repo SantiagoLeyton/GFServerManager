@@ -3,15 +3,16 @@ from __future__ import annotations
 import json
 import logging
 import socket
+import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .logging_config import app_root
+from .logging_config import data_dir, source_root
 
 
-CONFIG_PATH = app_root() / "data" / "server_manager.json"
+CONFIG_PATH = data_dir() / "server_manager.json"
 LOGGER = logging.getLogger(__name__)
 
 
@@ -117,21 +118,46 @@ def is_config_complete(config: dict[str, Any] | None) -> bool:
 
 
 def try_reconstruct_config(search_root: Path | None = None) -> dict[str, Any] | None:
-    root = search_root or app_root().parent
+    if getattr(sys, "frozen", False) and search_root is None:
+        LOGGER.warning(
+            "Reconstruccion automatica omitida en modo empaquetado. config_path=%s source_root=%s",
+            CONFIG_PATH,
+            source_root(),
+        )
+        return None
+    root = search_root or source_root().parent
     candidates = [root / "PagosFiducia", root / "GestionFiduciaria"]
-    for project_path in candidates:
-        venv_path = project_path / ".venv"
-        if (
-            (project_path / "manage.py").exists()
-            and (project_path / "config" / "wsgi.py").exists()
-            and (project_path / ".env").exists()
-            and (venv_path / "Scripts" / "python.exe").exists()
-        ):
-            config = build_config(project_path, venv_path, 8000, pid=None)
-            save_config(config)
-            LOGGER.warning("server_manager.json fue reconstruido desde %s", project_path)
-            return load_config()
-    LOGGER.warning("No se pudo reconstruir server_manager.json automaticamente")
+    try:
+        for project_path in candidates:
+            venv_path = project_path / ".venv"
+            LOGGER.info(
+                "Intentando reconstruir configuracion candidate=%s config_destino=%s",
+                project_path,
+                CONFIG_PATH,
+            )
+            if (
+                (project_path / "manage.py").exists()
+                and (project_path / "config" / "wsgi.py").exists()
+                and (project_path / ".env").exists()
+                and (venv_path / "Scripts" / "python.exe").exists()
+            ):
+                config = build_config(project_path, venv_path, 8000, pid=None)
+                save_config(config)
+                LOGGER.warning("server_manager.json fue reconstruido desde %s", project_path)
+                return load_config()
+    except Exception:
+        LOGGER.exception(
+            "Fallo real reconstruyendo server_manager.json. config_destino=%s root_busqueda=%s",
+            CONFIG_PATH,
+            root,
+        )
+        return None
+    LOGGER.warning(
+        "No se pudo reconstruir server_manager.json automaticamente. config_destino=%s root_busqueda=%s candidates=%s",
+        CONFIG_PATH,
+        root,
+        candidates,
+    )
     return None
 
 

@@ -1,7 +1,12 @@
 __pycache__/
 *.py[cod]
 .venv/
+.build-venv/
+build/
+dist/
+installer-output/
+*.log
+*.tmp
 data/server_manager.json
 logs/*.log
 logs/*.log.*
-

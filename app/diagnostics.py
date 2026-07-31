@@ -11,7 +11,7 @@ from .config_manager import CONFIG_PATH, load_config, try_reconstruct_config, va
 from .database_manager import test_connection
 from .django_manager import python_executable
 from .environment_manager import env_database_credentials, is_env_valid, read_env
-from .logging_config import app_root
+from .logging_config import logs_dir
 from .metadata import APP_VERSION
 from .project_validator import validate_project
 from .server_manager import SERVER_RUNNING, SERVER_STOPPED, get_server_status
@@ -87,9 +87,7 @@ def run_diagnostics(config: dict | None = None) -> DiagnosticReport:
 
 
 def export_diagnostics(report: DiagnosticReport) -> Path:
-    logs_dir = app_root() / "logs"
-    logs_dir.mkdir(exist_ok=True)
-    path = logs_dir / f"diagnostico_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    path = logs_dir() / f"diagnostico_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     lines = [
         "Gestion Fiduciaria Server Manager - Diagnostico",
         f"Fecha y hora: {report.generated_at}",
