@@ -15,6 +15,7 @@ from .diagnostics import DiagnosticReport, export_diagnostics, level_icon, run_d
 from .django_manager import find_static_probe_url
 from .environment_manager import env_database_credentials, is_env_valid, read_env
 from .logging_config import app_root
+from .metadata import APP_AUTHOR, APP_DESCRIPTION, APP_LICENSE, APP_TECHNOLOGIES, APP_VERSION, APP_YEAR, PRODUCT_NAME
 from .project_validator import validate_project
 from .server_manager import (
     get_server_status,
@@ -25,6 +26,7 @@ from .server_manager import (
     wait_for_http,
     wait_for_static_file,
 )
+from .ui_components import Dialogs, apply_app_icon, attach_tooltip, configure_styles, timestamp_text
 from .user_manager import change_password, create_user, list_users, set_user_active
 
 
@@ -45,6 +47,15 @@ class AdminPanel(ttk.Frame):
         self.server_labels: dict[str, ttk.Label] = {}
         self.db_labels: dict[str, ttk.Label] = {}
         self.config_vars: dict[str, StringVar | IntVar] = {}
+        self.nav_items: dict[str, ttk.Label] = {}
+        self.server_cards: dict[str, dict[str, ttk.Label]] = {}
+        self.status_bar_labels: dict[str, ttk.Label] = {}
+        self.operation_message = StringVar(value="Listo")
+        self.status_general = StringVar(value="Sistema sin actualizar")
+        self.status_server = StringVar(value="Servidor sin actualizar")
+        self.status_updated = StringVar(value="Ultima actualizacion: No disponible")
+        self.operation_progress: ttk.Progressbar | None = None
+        self._diagnostics_signature: tuple[object, ...] | None = None
         self.users_tree: ttk.Treeview | None = None
         self.logs_text: scrolledtext.ScrolledText | None = None
         self.diagnostics_tree: ttk.Treeview | None = None
@@ -92,51 +103,97 @@ class AdminPanel(ttk.Frame):
             return None
 
     def _build(self) -> None:
-        self.master.title("Gestion Fiduciaria Server Manager")
+        self.master.title(PRODUCT_NAME)
+        apply_app_icon(self.master)
+        configure_styles()
         self.master.geometry("1120x760")
         self.master.minsize(980, 640)
         self.master.columnconfigure(0, weight=1)
         self.master.rowconfigure(0, weight=1)
 
+        self.configure(style="App.TFrame")
         self.grid(sticky="nsew")
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
+        self.rowconfigure(1, weight=0)
 
-        style = ttk.Style()
-        style.configure("Sidebar.TFrame", background="#17202a")
-        style.configure("Title.TLabel", font=("Segoe UI", 16, "bold"))
-        style.configure("Section.TLabel", font=("Segoe UI", 12, "bold"))
-        style.configure("Card.TFrame", relief="solid", borderwidth=1)
-
-        sidebar = ttk.Frame(self, width=210, style="Sidebar.TFrame", padding=(12, 16))
+        sidebar = ttk.Frame(self, width=230, style="Sidebar.TFrame", padding=(12, 18))
         sidebar.grid(row=0, column=0, sticky="ns")
         sidebar.grid_propagate(False)
 
-        ttk.Label(
-            sidebar,
-            text="Server Manager",
-            foreground="white",
-            background="#17202a",
-            font=("Segoe UI", 13, "bold"),
-        ).pack(anchor="w", pady=(0, 18))
+        ttk.Label(sidebar, text="Gestion Fiduciaria", style="SidebarTitle.TLabel").pack(anchor="w")
+        ttk.Label(sidebar, text=f"Server Manager v{APP_VERSION}", style="SidebarSubtle.TLabel").pack(
+            anchor="w", pady=(2, 22)
+        )
 
-        for section in ["Inicio", "Servidor", "Base de datos", "Usuarios", "Configuración", "Logs", "Diagnóstico"]:
-            ttk.Button(sidebar, text=section, command=lambda name=section: self._show_section(name)).pack(
-                fill="x", pady=4
-            )
+        main_sections = ["Inicio", "Servidor", "Base de datos", "Usuarios", "Configuración"]
+        support_sections = ["Logs", "Diagnóstico", "Acerca de"]
+        self._build_nav_group(sidebar, main_sections)
+        ttk.Separator(sidebar).pack(fill="x", pady=14)
+        self._build_nav_group(sidebar, support_sections)
 
         ttk.Separator(sidebar).pack(fill="x", pady=14)
-        ttk.Button(sidebar, text="Reinstalar", command=self._reinstall).pack(fill="x", pady=4)
+        reinstall = ttk.Button(sidebar, text="Reinstalar", command=self._reinstall)
+        reinstall.pack(fill="x", pady=(2, 0))
+        attach_tooltip(reinstall, "Abre el asistente para configurar nuevamente la instalacion.")
 
-        self.content = ttk.Frame(self, padding=18)
+        ttk.Frame(sidebar, style="Sidebar.TFrame").pack(fill="both", expand=True)
+        ttk.Label(sidebar, text="Administracion local", style="SidebarSubtle.TLabel").pack(anchor="w", pady=(14, 0))
+
+        self.content = ttk.Frame(self, padding=22, style="Content.TFrame")
         self.content.grid(row=0, column=1, sticky="nsew")
         self.content.columnconfigure(0, weight=1)
         self.content.rowconfigure(1, weight=1)
+
+        self._build_status_bar()
+
+    def _build_nav_group(self, parent: ttk.Frame, sections: list[str]) -> None:
+        for section in sections:
+            item = ttk.Label(parent, text=f"  {section}", style="Nav.TLabel", cursor="hand2")
+            item.pack(fill="x", pady=2)
+            item.bind("<Button-1>", lambda _event, name=section: self._show_section(name), add="+")
+            item.bind("<Return>", lambda _event, name=section: self._show_section(name), add="+")
+            item.bind("<Enter>", lambda _event, label=item, name=section: self._nav_hover(label, name, True), add="+")
+            item.bind("<Leave>", lambda _event, label=item, name=section: self._nav_hover(label, name, False), add="+")
+            item.configure(takefocus=True)
+            self.nav_items[section] = item
+
+    def _build_status_bar(self) -> None:
+        bar = ttk.Frame(self, style="StatusBar.TFrame", padding=(14, 6))
+        bar.grid(row=1, column=0, columnspan=2, sticky="ew")
+        values = [
+            ("version", StringVar(value=f"v{APP_VERSION}")),
+            ("general", self.status_general),
+            ("server", self.status_server),
+            ("updated", self.status_updated),
+            ("operation", self.operation_message),
+        ]
+        for column, (key, variable) in enumerate(values):
+            label = ttk.Label(bar, textvariable=variable, style="StatusBar.TLabel")
+            label.grid(row=0, column=column, sticky="w", padx=(0, 18))
+            self.status_bar_labels[key] = label
+        self.operation_progress = ttk.Progressbar(bar, mode="indeterminate", length=120)
+        self.operation_progress.grid(row=0, column=5, sticky="e")
+        bar.columnconfigure(4, weight=1)
+
+    def _nav_hover(self, widget: ttk.Label, section: str, hovering: bool) -> None:
+        if section == self.current_section:
+            return
+        widget.configure(style="NavHover.TLabel" if hovering else "Nav.TLabel")
+
+    def _update_nav_state(self) -> None:
+        for section, widget in self.nav_items.items():
+            if self._widget_exists(widget):
+                widget.configure(
+                    text=f"| {section}" if section == self.current_section else f"  {section}",
+                    style="NavActive.TLabel" if section == self.current_section else "Nav.TLabel",
+                )
 
     def _show_section(self, name: str) -> None:
         if self._closed or not self._widget_exists(self.content):
             return
         self.current_section = name
+        self._update_nav_state()
         self._clear_dynamic_references()
         for child in self.content.winfo_children():
             child.destroy()
@@ -155,6 +212,7 @@ class AdminPanel(ttk.Frame):
             "Configuración": self._build_configuration,
             "Logs": self._build_logs,
             "Diagnóstico": self._build_diagnostics,
+            "Acerca de": self._build_about,
         }
         builders[name](container)
         self._refresh_status()
@@ -163,6 +221,7 @@ class AdminPanel(ttk.Frame):
         self.status_labels.clear()
         self.info_labels.clear()
         self.server_labels.clear()
+        self.server_cards.clear()
         self.db_labels.clear()
         self.config_vars.clear()
         self.users_tree = None
@@ -216,25 +275,45 @@ class AdminPanel(ttk.Frame):
             ("Abrir carpeta de logs", lambda: self._open_folder(app_root() / "logs")),
         ]
         for index, (text, command) in enumerate(buttons):
-            ttk.Button(actions, text=text, command=command).grid(
+            button = ttk.Button(actions, text=text, command=command)
+            button.grid(
                 row=1 + index // 3, column=index % 3, sticky="ew", padx=4, pady=4
             )
+            attach_tooltip(button, text)
             actions.columnconfigure(index % 3, weight=1)
 
     def _build_server(self, parent: ttk.Frame) -> None:
-        card = self._card(parent, "Proceso Waitress")
-        card.grid(row=0, column=0, sticky="nsew")
-        for index, label in enumerate(["Estado", "PID", "Host", "Puerto", "Tiempo de ejecución", "Proceso en puerto"]):
-            ttk.Label(card, text=label + ":").grid(row=index + 1, column=0, sticky="w", pady=4)
-            widget = ttk.Label(card, text=NOT_AVAILABLE)
-            widget.grid(row=index + 1, column=1, sticky="w", pady=4)
-            self.server_labels[label] = widget
+        parent.columnconfigure((0, 1, 2), weight=1)
+        cards = [
+            ("Estado", "Estado actual del servicio Waitress"),
+            ("Puerto", "Disponibilidad del puerto configurado"),
+            ("PID", "Identificador del proceso activo"),
+            ("Tiempo de ejecución", "Tiempo desde el ultimo inicio"),
+            ("URL", "Direccion local de la aplicacion"),
+            ("Proceso en puerto", "Proceso que atiende el puerto"),
+        ]
+        for index, (title, detail) in enumerate(cards):
+            card = ttk.Frame(parent, padding=14, style="Card.TFrame")
+            card.grid(row=index // 3, column=index % 3, sticky="nsew", padx=6, pady=6)
+            ttk.Label(card, text=title, style="CardTitle.TLabel").pack(anchor="w")
+            value = ttk.Label(card, text=NOT_AVAILABLE, style="CardValue.TLabel", wraplength=260)
+            value.pack(anchor="w", pady=(8, 2))
+            detail_label = ttk.Label(card, text=detail, style="CardDetail.TLabel", wraplength=260)
+            detail_label.pack(anchor="w")
+            self.server_labels[title] = value
+            self.server_cards[title] = {"value": value, "detail": detail_label}
 
-        buttons = ttk.Frame(card)
-        buttons.grid(row=8, column=0, columnspan=2, sticky="w", pady=(14, 0))
-        ttk.Button(buttons, text="Iniciar", command=self._start_server).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="Detener", command=self._stop_server).pack(side="left", padx=8)
-        ttk.Button(buttons, text="Reiniciar", command=self._restart_server).pack(side="left", padx=8)
+        buttons = ttk.Frame(parent, style="Content.TFrame")
+        buttons.grid(row=3, column=0, columnspan=3, sticky="w", pady=(18, 0))
+        start = ttk.Button(buttons, text="Iniciar", command=self._start_server, style="Primary.TButton")
+        stop = ttk.Button(buttons, text="Detener", command=self._stop_server)
+        restart = ttk.Button(buttons, text="Reiniciar", command=self._restart_server)
+        start.pack(side="left", padx=(0, 8))
+        stop.pack(side="left", padx=8)
+        restart.pack(side="left", padx=8)
+        attach_tooltip(start, "Inicia Waitress si no existe un proceso activo.")
+        attach_tooltip(stop, "Detiene solo el proceso Waitress iniciado por Server Manager.")
+        attach_tooltip(restart, "Detiene Waitress y lo inicia nuevamente con la configuracion actual.")
 
     def _build_database(self, parent: ttk.Frame) -> None:
         card = self._card(parent, "Base de datos")
@@ -244,9 +323,11 @@ class AdminPanel(ttk.Frame):
             widget = ttk.Label(card, text=NOT_AVAILABLE)
             widget.grid(row=index + 1, column=1, sticky="w", pady=4)
             self.db_labels[label] = widget
-        ttk.Button(card, text="Probar conexión", command=self._test_database).grid(
+        test_button = ttk.Button(card, text="Probar conexión", command=self._test_database)
+        test_button.grid(
             row=7, column=0, sticky="w", pady=(14, 0)
         )
+        attach_tooltip(test_button, "Comprueba la conexion con PostgreSQL usando el archivo .env.")
 
     def _build_users(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(0, weight=1)
@@ -270,10 +351,16 @@ class AdminPanel(ttk.Frame):
 
         buttons = ttk.Frame(parent)
         buttons.grid(row=1, column=0, sticky="w", pady=(12, 0))
-        ttk.Button(buttons, text="Actualizar", command=self._load_users).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="Crear usuario", command=self._open_create_user_dialog).pack(side="left", padx=8)
-        ttk.Button(buttons, text="Cambiar contraseña", command=self._open_password_dialog).pack(side="left", padx=8)
-        ttk.Button(buttons, text="Activar/desactivar", command=self._toggle_user_active).pack(side="left", padx=8)
+        user_buttons = [
+            ("Actualizar", self._load_users, "Recarga la lista de usuarios desde Django."),
+            ("Crear usuario", self._open_create_user_dialog, "Crea un usuario usando el modelo real de Django."),
+            ("Cambiar contraseña", self._open_password_dialog, "Actualiza la contraseña del usuario seleccionado."),
+            ("Activar/desactivar", self._toggle_user_active, "Cambia el estado activo del usuario seleccionado."),
+        ]
+        for index, (text, command, tooltip) in enumerate(user_buttons):
+            button = ttk.Button(buttons, text=text, command=command)
+            button.pack(side="left", padx=(0, 8) if index == 0 else 8)
+            attach_tooltip(button, tooltip)
         self._load_users()
 
     def _build_configuration(self, parent: ttk.Frame) -> None:
@@ -293,18 +380,22 @@ class AdminPanel(ttk.Frame):
             entry.grid(row=index + 1, column=1, sticky="ew", pady=4)
             self.config_vars[label] = var
         card.columnconfigure(1, weight=1)
-        ttk.Button(card, text="Guardar host y puerto", command=self._save_host_port).grid(
+        save_button = ttk.Button(card, text="Guardar host y puerto", command=self._save_host_port)
+        save_button.grid(
             row=7, column=0, sticky="w", pady=(14, 0)
         )
+        attach_tooltip(save_button, "Guarda solo el host y puerto del Server Manager.")
 
     def _build_logs(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(0, weight=1)
         parent.columnconfigure(0, weight=1)
         self.logs_text = scrolledtext.ScrolledText(parent, wrap="word")
         self.logs_text.grid(row=0, column=0, sticky="nsew")
-        ttk.Button(parent, text="Abrir carpeta de logs", command=lambda: self._open_folder(app_root() / "logs")).grid(
+        logs_button = ttk.Button(parent, text="Abrir carpeta de logs", command=lambda: self._open_folder(app_root() / "logs"))
+        logs_button.grid(
             row=1, column=0, sticky="w", pady=(12, 0)
         )
+        attach_tooltip(logs_button, "Abre la carpeta donde se guardan los registros del Server Manager.")
         self._refresh_logs()
 
     def _build_diagnostics(self, parent: ttk.Frame) -> None:
@@ -325,9 +416,41 @@ class AdminPanel(ttk.Frame):
 
         buttons = ttk.Frame(parent)
         buttons.grid(row=1, column=0, sticky="w", pady=(12, 0))
-        ttk.Button(buttons, text="Ejecutar diagnóstico", command=self._run_diagnostics_clicked).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="Exportar diagnóstico", command=self._export_diagnostics_clicked).pack(side="left", padx=8)
+        run_button = ttk.Button(buttons, text="Ejecutar diagnóstico", command=self._run_diagnostics_clicked)
+        export_button = ttk.Button(buttons, text="Exportar diagnóstico", command=self._export_diagnostics_clicked)
+        run_button.pack(side="left", padx=(0, 8))
+        export_button.pack(side="left", padx=8)
+        attach_tooltip(run_button, "Revisa la instalacion, el servidor, PostgreSQL y archivos locales.")
+        attach_tooltip(export_button, "Guarda el resultado del diagnostico en un archivo de texto.")
         self._run_diagnostics_clicked()
+
+    def _build_about(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        card = self._card(parent, PRODUCT_NAME)
+        card.grid(row=0, column=0, sticky="ew")
+        rows = [
+            ("Version", APP_VERSION),
+            ("Descripcion", APP_DESCRIPTION),
+            ("Autor", APP_AUTHOR),
+            ("Anio", APP_YEAR),
+            ("Tecnologias", ", ".join(APP_TECHNOLOGIES)),
+            ("Licencia", APP_LICENSE),
+        ]
+        for index, (label, value) in enumerate(rows, start=1):
+            ttk.Label(card, text=f"{label}:", style="CardTitle.TLabel").grid(row=index, column=0, sticky="nw", pady=5)
+            ttk.Label(card, text=value, style="CardDetail.TLabel", wraplength=760).grid(
+                row=index, column=1, sticky="w", pady=5
+            )
+        card.columnconfigure(1, weight=1)
+
+        icon_card = self._card(parent, "Icono de aplicacion")
+        icon_card.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+        ttk.Label(
+            icon_card,
+            text="La ruta assets/app.ico queda preparada para ventana principal y futura compilacion con PyInstaller.",
+            style="CardDetail.TLabel",
+            wraplength=760,
+        ).grid(row=1, column=0, sticky="w")
 
     def _card(self, parent: ttk.Frame, title: str) -> ttk.Frame:
         frame = ttk.Frame(parent, padding=14, style="Card.TFrame")
@@ -358,7 +481,7 @@ class AdminPanel(ttk.Frame):
 
         if self.current_section == "Inicio":
             for label, ok in statuses.items():
-                self._set_label(self.status_labels.get(label), f"{'●' if ok else '○'} {label}")
+                self._set_indicator_label(self.status_labels.get(label), label, "ok" if ok else "warning")
             self._set_label(self.info_labels.get("Ruta del proyecto"), self._value_or_na(str(self.project_path)))
             self._set_label(self.info_labels.get("Host"), self._value_or_na(self.host))
             self._set_label(self.info_labels.get("Puerto"), self._value_or_na(str(self.port)))
@@ -367,12 +490,12 @@ class AdminPanel(ttk.Frame):
             self._set_label(self.info_labels.get("Tiempo desde el último inicio"), self._value_or_na(server_status.uptime))
 
         if self.current_section == "Servidor":
-            self._set_label(self.server_labels.get("Estado"), server_status.state)
-            self._set_label(self.server_labels.get("PID"), str(server_status.pid) if server_status.pid else NOT_AVAILABLE)
-            self._set_label(self.server_labels.get("Host"), self._value_or_na(server_status.host))
-            self._set_label(self.server_labels.get("Puerto"), server_status.port_message)
-            self._set_label(self.server_labels.get("Tiempo de ejecución"), self._value_or_na(server_status.uptime))
-            self._set_label(self.server_labels.get("Proceso en puerto"), server_status.process_message)
+            self._set_server_card("Estado", server_status.state, "Servicio disponible" if server_status.running else "Servicio sin proceso activo")
+            self._set_server_card("Puerto", server_status.port_message, f"Host configurado: {server_status.host}")
+            self._set_server_card("PID", str(server_status.pid) if server_status.pid else NOT_AVAILABLE, server_status.process_message)
+            self._set_server_card("Tiempo de ejecución", self._value_or_na(server_status.uptime), "Se actualiza automaticamente")
+            self._set_server_card("URL", f"http://127.0.0.1:{server_status.port}/", "Direccion local para abrir la aplicacion")
+            self._set_server_card("Proceso en puerto", server_status.process_message, "Debe coincidir con Gestion Fiduciaria")
 
         if self.current_section == "Base de datos":
             env = self._safe_read_env()
@@ -386,7 +509,9 @@ class AdminPanel(ttk.Frame):
             )
 
         if self.current_section == "Diagnóstico":
-            self._run_diagnostics_clicked()
+            self._run_diagnostics_clicked(force=False, signature=self._diagnostics_signature_for(server_status))
+
+        self._update_status_bar(statuses, server_status)
 
     def _status_snapshot(self, server_status=None) -> dict[str, bool]:
         project_ok = False
@@ -426,7 +551,7 @@ class AdminPanel(ttk.Frame):
             if not result.ok:
                 if not silent:
                     self._set_label(self.db_labels.get("Estado de conexión"), f"{result.message} ({result.elapsed_ms} ms)")
-                    messagebox.showerror("Base de datos", result.message)
+                    Dialogs.error("Base de datos", result.message)
                 return False
             if not silent:
                 self._set_label(self.db_labels.get("Estado de conexión"), f"Conectada ({result.elapsed_ms} ms)")
@@ -437,12 +562,12 @@ class AdminPanel(ttk.Frame):
             else:
                 LOGGER.exception("Fallo la prueba de conexion a base de datos")
                 self._set_label(self.db_labels.get("Estado de conexión"), "Sin conexión")
-                messagebox.showerror("Base de datos", str(exc))
+                Dialogs.error("Base de datos", str(exc))
             return False
 
     def _test_database(self) -> None:
         if self._database_ok(silent=False):
-            messagebox.showinfo("Base de datos", "Conexión comprobada correctamente.")
+            Dialogs.success("Base de datos", "Conexión comprobada correctamente.")
 
     def _start_server(self) -> None:
         self._run_background(self._start_server_worker, "Servidor")
@@ -520,7 +645,7 @@ class AdminPanel(ttk.Frame):
                 )
         except Exception as exc:
             LOGGER.exception("Fallo la lectura de usuarios")
-            messagebox.showerror("Usuarios", str(exc))
+            Dialogs.error("Usuarios", str(exc))
 
     def _selected_user_id(self) -> int | None:
         if not self._widget_exists(self.users_tree):
@@ -543,7 +668,7 @@ class AdminPanel(ttk.Frame):
     def _open_password_dialog(self) -> None:
         user_id = self._selected_user_id()
         if not user_id:
-            messagebox.showwarning("Usuarios", "Seleccione un usuario.")
+            Dialogs.warning("Usuarios", "Seleccione un usuario.")
             return
         dialog = _PasswordDialog(self.master)
         self.master.wait_window(dialog)
@@ -558,12 +683,12 @@ class AdminPanel(ttk.Frame):
     def _toggle_user_active(self) -> None:
         user_id = self._selected_user_id()
         if not user_id or not self._widget_exists(self.users_tree):
-            messagebox.showwarning("Usuarios", "Seleccione un usuario.")
+            Dialogs.warning("Usuarios", "Seleccione un usuario.")
             return
         values = self.users_tree.item(str(user_id), "values")
         is_active = values[2] == "Sí"
         action = "desactivar" if is_active else "activar"
-        if not messagebox.askyesno("Usuarios", f"¿Desea {action} este usuario?"):
+        if not Dialogs.confirm("Usuarios", f"¿Desea {action} este usuario?"):
             return
         self._run_background(lambda: self._toggle_user_worker(user_id, not is_active), "Usuarios")
 
@@ -582,9 +707,9 @@ class AdminPanel(ttk.Frame):
                 raise ValueError("El puerto debe estar entre 1024 y 65535.")
             self.config = update_config({"host": host, "port": port})
             LOGGER.info("Configuracion actualizada: host=%s port=%s", host, port)
-            messagebox.showinfo("Configuración", "Host y puerto guardados. Reinicie el servidor para aplicar cambios.")
+            Dialogs.success("Configuración", "Host y puerto guardados. Reinicie el servidor para aplicar cambios.")
         except Exception as exc:
-            messagebox.showerror("Configuración", str(exc))
+            Dialogs.error("Configuración", str(exc))
 
     def _open_application(self) -> None:
         webbrowser.open(f"http://127.0.0.1:{self.port}/")
@@ -595,7 +720,7 @@ class AdminPanel(ttk.Frame):
         if path.exists():
             os.startfile(path)
         else:
-            messagebox.showerror("Carpeta", f"No existe: {path}")
+            Dialogs.error("Carpeta", f"No existe: {path}")
 
     def _refresh_logs(self) -> None:
         if not self._widget_exists(self.logs_text):
@@ -611,23 +736,44 @@ class AdminPanel(ttk.Frame):
         self.logs_text.insert("end", content)
         self.logs_text.see("end")
 
-    def _run_diagnostics_clicked(self) -> None:
+    def _run_diagnostics_clicked(self, force: bool = True, signature: tuple[object, ...] | None = None) -> None:
+        signature = signature or self._diagnostics_signature_for(get_server_status(load_config()))
+        if not force and signature == self._diagnostics_signature:
+            return
+        self._set_busy(True, "Ejecutando diagnostico...")
         self.diagnostics_report = run_diagnostics(load_config())
+        self._diagnostics_signature = signature
         if not self._widget_exists(self.diagnostics_tree):
+            self._set_busy(False, "Listo")
             return
         self.diagnostics_tree.delete(*self.diagnostics_tree.get_children())
         for item in self.diagnostics_report.items:
             self.diagnostics_tree.insert("", "end", values=(level_icon(item.level), item.name, item.message))
         LOGGER.info("Diagnostico ejecutado: %s", self.diagnostics_report.overall_message)
+        self._set_busy(False, "Diagnostico actualizado")
+
+    def _diagnostics_signature_for(self, server_status) -> tuple[object, ...]:
+        return (
+            server_status.state,
+            server_status.pid,
+            server_status.port,
+            server_status.listening,
+            self.config.get("project_path"),
+            self.config.get("venv_path"),
+            self.config.get("installation_status"),
+        )
 
     def _export_diagnostics_clicked(self) -> None:
         try:
+            self._set_busy(True, "Exportando diagnostico...")
             report = self.diagnostics_report or run_diagnostics(load_config())
             path = export_diagnostics(report)
-            messagebox.showinfo("Diagnóstico", f"Diagnóstico exportado en:\n{path}")
+            Dialogs.success("Diagnóstico", f"Diagnóstico exportado en:\n{path}")
         except Exception as exc:
             LOGGER.exception("No se pudo exportar diagnostico")
-            messagebox.showerror("Diagnóstico", str(exc))
+            Dialogs.error("Diagnóstico", str(exc))
+        finally:
+            self._set_busy(False, "Listo")
 
     def _schedule_logs(self) -> None:
         if self._closed or self._logs_after_id is not None or not self._widget_exists(self.master):
@@ -648,20 +794,22 @@ class AdminPanel(ttk.Frame):
     def _run_background(self, target, title: str) -> None:
         def runner() -> None:
             try:
+                self._after_ui(lambda: self._set_busy(True, f"{title}: operacion en curso..."))
                 target()
             except Exception as exc:
                 LOGGER.exception("Fallo en accion del panel")
-                self._after_ui(lambda: messagebox.showerror(title, str(exc)))
+                self._after_ui(lambda: Dialogs.error(title, str(exc)))
             finally:
+                self._after_ui(lambda: self._set_busy(False, "Listo"))
                 self._after_ui(self._refresh_status)
 
         threading.Thread(target=runner, daemon=True).start()
 
     def _info(self, title: str, message: str) -> None:
-        self._after_ui(lambda: messagebox.showinfo(title, message))
+        self._after_ui(lambda: Dialogs.success(title, message))
 
     def _reinstall(self) -> None:
-        if not messagebox.askyesno("Reinstalar", "¿Desea abrir el asistente de instalación?"):
+        if not Dialogs.confirm("Reinstalar", "¿Desea abrir el asistente de instalación?"):
             return
         if self.on_reinstall:
             self._dispose()
@@ -682,10 +830,10 @@ class AdminPanel(ttk.Frame):
                 return
             if answer is False:
                 if not is_waitress_process(target_pid, self.project_path):
-                    messagebox.showerror("Salir", "El PID almacenado no corresponde al Waitress de Gestion Fiduciaria.")
+                    Dialogs.error("Salir", "El PID almacenado no corresponde al Waitress de Gestion Fiduciaria.")
                     return
                 if not stop_process(target_pid):
-                    messagebox.showerror("Salir", "No se pudo detener el proceso Waitress.")
+                    Dialogs.error("Salir", "No se pudo detener el proceso Waitress.")
                     return
                 update_config({"pid": None})
         self._dispose()
@@ -716,6 +864,38 @@ class AdminPanel(ttk.Frame):
     def _set_label(self, widget: ttk.Label | None, text: str) -> None:
         if self._widget_exists(widget):
             widget.configure(text=text)
+
+    def _set_indicator_label(self, widget: ttk.Label | None, text: str, level: str) -> None:
+        if not self._widget_exists(widget):
+            return
+        prefix = {"ok": "OK", "warning": "!", "error": "X"}.get(level, "?")
+        style = {"ok": "Ok.TLabel", "warning": "Warning.TLabel", "error": "Error.TLabel"}.get(level, "Muted.TLabel")
+        widget.configure(text=f"{prefix}  {text}", style=style)
+
+    def _set_server_card(self, name: str, value: str, detail: str) -> None:
+        self._set_label(self.server_labels.get(name), self._value_or_na(value))
+        detail_label = self.server_cards.get(name, {}).get("detail")
+        self._set_label(detail_label, self._value_or_na(detail))
+
+    def _update_status_bar(self, statuses: dict[str, bool], server_status) -> None:
+        general_ok = all(statuses.values())
+        if general_ok:
+            general_text = "Sistema correcto"
+        elif statuses.get("Proyecto configurado") and statuses.get("Archivo .env válido"):
+            general_text = "Sistema con advertencias"
+        else:
+            general_text = "Sistema requiere atencion"
+        self.status_general.set(general_text)
+        self.status_server.set(server_status.state)
+        self.status_updated.set(f"Ultima actualizacion: {timestamp_text()}")
+
+    def _set_busy(self, running: bool, message: str) -> None:
+        self.operation_message.set(message)
+        if self._widget_exists(self.operation_progress):
+            if running:
+                self.operation_progress.start(12)
+            else:
+                self.operation_progress.stop()
 
     def _widget_exists(self, widget) -> bool:
         if widget is None:
@@ -805,10 +985,10 @@ class _UserDialog(Toplevel):
     def _accept(self) -> None:
         data = {key: var.get().strip() for key, var in self.vars.items()}
         if not data["username"] or not data["email"] or not data["password"]:
-            messagebox.showerror("Usuarios", "Usuario, correo y contraseña son obligatorios.")
+            Dialogs.error("Usuarios", "Usuario, correo y contraseña son obligatorios.")
             return
         if data["password"] != data.pop("password2"):
-            messagebox.showerror("Usuarios", "Las contraseñas no coinciden.")
+            Dialogs.error("Usuarios", "Las contraseñas no coinciden.")
             return
         role = self.role.get()
         data["role"] = role
@@ -840,16 +1020,10 @@ class _PasswordDialog(Toplevel):
 
     def _accept(self) -> None:
         if not self.password.get():
-            messagebox.showerror("Usuarios", "Digite la nueva contraseña.")
+            Dialogs.error("Usuarios", "Digite la nueva contraseña.")
             return
         if self.password.get() != self.password2.get():
-            messagebox.showerror("Usuarios", "Las contraseñas no coinciden.")
+            Dialogs.error("Usuarios", "Las contraseñas no coinciden.")
             return
         self.result = self.password.get()
         self.destroy()
-
-
-def run(on_reinstall=None) -> None:
-    root = Tk()
-    AdminPanel(root, on_reinstall=on_reinstall)
-    root.mainloop()

@@ -4,11 +4,11 @@ import logging
 import queue
 import threading
 from pathlib import Path
-from tkinter import BooleanVar, IntVar, StringVar, Tk, filedialog, messagebox
+from tkinter import BooleanVar, IntVar, StringVar, Tk, filedialog
 from tkinter import scrolledtext
 from tkinter import ttk
 
-from .config_manager import build_config, detect_hostname, detect_local_ipv4, save_config
+from .config_manager import build_config, save_config
 from .database_manager import (
     AdminDatabaseCredentials,
     DatabaseCredentials,
@@ -17,9 +17,11 @@ from .database_manager import (
 )
 from .django_manager import collectstatic, ensure_virtualenv, find_static_probe_url, install_dependencies, migrate
 from .environment_manager import build_env_values, write_env
+from .metadata import PRODUCT_NAME
 from .project_validator import validate_project
 from .requirements_checker import check_requirements
 from .server_manager import find_waitress_listener_pid, start_waitress, wait_for_http, wait_for_static_file
+from .ui_components import Dialogs, apply_app_icon, attach_tooltip, configure_styles
 from .user_manager import InitialUser, create_or_update_initial_users
 
 
@@ -57,14 +59,19 @@ class InstallWizard(ttk.Frame):
         self.commercial_password = StringVar()
         self.commercial_password_confirm = StringVar()
         self.update_existing_passwords = BooleanVar(value=False)
+        self.operation_message = StringVar(value="Listo para instalar")
+        self.operation_progress: ttk.Progressbar | None = None
 
         self._build()
         self._schedule_poll()
         self._run_requirement_check()
 
     def _build(self) -> None:
-        self.master.title("Gestion Fiduciaria Server Manager - Instalacion")
+        self.master.title(f"{PRODUCT_NAME} - Instalacion")
+        configure_styles()
+        apply_app_icon(self.master)
         self.master.geometry("900x720")
+        self.master.minsize(860, 640)
         self.grid(sticky="nsew")
         self.master.columnconfigure(0, weight=1)
         self.master.rowconfigure(0, weight=1)
@@ -92,8 +99,12 @@ class InstallWizard(ttk.Frame):
         self.project_tab.columnconfigure(1, weight=1)
         ttk.Label(self.project_tab, text="Carpeta de Gestion Fiduciaria").grid(row=0, column=0, sticky="w")
         ttk.Entry(self.project_tab, textvariable=self.project_path).grid(row=1, column=0, columnspan=2, sticky="ew", pady=6)
-        ttk.Button(self.project_tab, text="Examinar", command=self._browse_project).grid(row=1, column=2, padx=(8, 0))
-        ttk.Button(self.project_tab, text="Validar proyecto", command=self._validate_project_clicked).grid(row=2, column=0, sticky="w")
+        browse = ttk.Button(self.project_tab, text="Examinar", command=self._browse_project)
+        validate = ttk.Button(self.project_tab, text="Validar proyecto", command=self._validate_project_clicked)
+        browse.grid(row=1, column=2, padx=(8, 0))
+        validate.grid(row=2, column=0, sticky="w")
+        attach_tooltip(browse, "Seleccione la carpeta real del proyecto Django Gestion Fiduciaria.")
+        attach_tooltip(validate, "Comprueba que la carpeta contiene la configuracion esperada.")
 
         self.project_status = scrolledtext.ScrolledText(self.project_tab, height=18, wrap="word")
         self.project_status.grid(row=3, column=0, columnspan=3, sticky="nsew", pady=(12, 0))
@@ -131,9 +142,11 @@ class InstallWizard(ttk.Frame):
                 row=index, column=1, sticky="ew", pady=4
             )
 
-        ttk.Button(self.database_tab, text="Probar conexion", command=self._test_database_clicked).grid(
+        test_button = ttk.Button(self.database_tab, text="Probar conexion", command=self._test_database_clicked)
+        test_button.grid(
             row=12, column=0, sticky="w", pady=(12, 0)
         )
+        attach_tooltip(test_button, "Verifica que los datos permiten conectar con PostgreSQL.")
 
     def _build_users_tab(self) -> None:
         self.users_tab.columnconfigure(1, weight=1)
@@ -170,14 +183,23 @@ class InstallWizard(ttk.Frame):
 
         self.install_button = ttk.Button(self.run_tab, text="Instalar y arrancar", command=self._install_clicked)
         self.install_button.grid(row=2, column=0, sticky="w")
+        attach_tooltip(self.install_button, "Ejecuta instalacion, migraciones, archivos estaticos y arranque del servidor.")
         if self.on_cancel:
-            ttk.Button(self.run_tab, text="Cancelar reinstalacion", command=self._cancel_clicked).grid(
+            cancel = ttk.Button(self.run_tab, text="Cancelar reinstalacion", command=self._cancel_clicked)
+            cancel.grid(
                 row=2, column=0, sticky="w", padx=(150, 0)
             )
+            attach_tooltip(cancel, "Vuelve al panel sin modificar la configuracion actual.")
 
-        self.output = scrolledtext.ScrolledText(self.run_tab, height=26, wrap="word")
-        self.output.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
-        self.run_tab.rowconfigure(3, weight=1)
+        status_frame = ttk.Frame(self.run_tab)
+        status_frame.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        ttk.Label(status_frame, textvariable=self.operation_message, style="Muted.TLabel").pack(side="left")
+        self.operation_progress = ttk.Progressbar(status_frame, mode="indeterminate", length=180)
+        self.operation_progress.pack(side="right")
+
+        self.output = scrolledtext.ScrolledText(self.run_tab, height=24, wrap="word")
+        self.output.grid(row=4, column=0, sticky="nsew", pady=(10, 0))
+        self.run_tab.rowconfigure(4, weight=1)
 
     def _browse_project(self) -> None:
         selected = filedialog.askdirectory(title="Seleccionar carpeta de Gestion Fiduciaria")
@@ -208,11 +230,14 @@ class InstallWizard(ttk.Frame):
 
     def _test_database_clicked(self) -> None:
         try:
+            self._set_busy(True, "Probando conexion a base de datos...")
             credentials = self._database_credentials()
             check_connection(credentials)
-            messagebox.showinfo("Base de datos", "Conexion comprobada correctamente.")
+            Dialogs.success("Base de datos", "Conexion comprobada correctamente.")
         except Exception as exc:
-            messagebox.showerror("Base de datos", str(exc))
+            Dialogs.error("Base de datos", str(exc))
+        finally:
+            self._set_busy(False, "Listo para instalar")
 
     def _install_clicked(self) -> None:
         if self.running:
@@ -223,18 +248,19 @@ class InstallWizard(ttk.Frame):
             env_path = Path(snapshot["project_path"]) / ".env"
             snapshot["backup_existing"] = False
             if env_path.exists():
-                accepted = messagebox.askyesno(
+                accepted = Dialogs.confirm(
                     ".env existente",
                     "Ya existe un archivo .env. Se creara un respaldo con fecha y hora antes de sobrescribirlo. Desea continuar?",
                 )
                 if not accepted:
-                    messagebox.showinfo("Instalacion", "Instalacion cancelada para no sobrescribir .env.")
+                    Dialogs.info("Instalacion", "Instalacion cancelada para no sobrescribir .env.")
                     return
                 snapshot["backup_existing"] = True
         except Exception as exc:
-            messagebox.showerror("Validacion", str(exc))
+            Dialogs.error("Validacion", str(exc))
             return
         self.running = True
+        self._set_busy(True, "Instalacion en curso...")
         self.install_button.configure(state="disabled")
         thread = threading.Thread(target=self._install_worker, args=(snapshot,), daemon=True)
         thread.start()
@@ -422,6 +448,7 @@ class InstallWizard(ttk.Frame):
             while True:
                 item_type, payload = self.queue.get_nowait()
                 if item_type == "log":
+                    self.operation_message.set(payload or "Instalacion en curso...")
                     if self._widget_exists(self.output):
                         self.output.insert("end", payload + "\n")
                         self.output.see("end")
@@ -430,8 +457,10 @@ class InstallWizard(ttk.Frame):
                     if self._widget_exists(self.install_button):
                         self.install_button.configure(state="normal")
                     if payload == "success":
+                        self._set_busy(False, "Instalacion finalizada correctamente")
                         self._finish_success()
                         return
+                    self._set_busy(False, "La instalacion no se completo")
         except queue.Empty:
             pass
         self._schedule_poll()
@@ -443,7 +472,7 @@ class InstallWizard(ttk.Frame):
 
     def _cancel_clicked(self) -> None:
         if self.running:
-            messagebox.showwarning("Reinstalacion", "No se puede cancelar mientras la instalacion esta en ejecucion.")
+            Dialogs.warning("Reinstalacion", "No se puede cancelar mientras la instalacion esta en ejecucion.")
             return
         if self.on_cancel:
             self._dispose()
@@ -457,6 +486,14 @@ class InstallWizard(ttk.Frame):
         if self._widget_exists(self.project_status):
             self.project_status.delete("1.0", "end")
             self.project_status.insert("end", text)
+
+    def _set_busy(self, running: bool, message: str) -> None:
+        self.operation_message.set(message)
+        if self._widget_exists(self.operation_progress):
+            if running:
+                self.operation_progress.start(12)
+            else:
+                self.operation_progress.stop()
 
     def _dispose(self) -> None:
         if self._closed:
@@ -492,9 +529,3 @@ def _sanitize(message: str) -> str:
     if "password" in lower or "contrasena" in lower or "secret" in lower:
         return "[mensaje sensible omitido]"
     return message
-
-
-def run() -> None:
-    root = Tk()
-    InstallWizard(root)
-    root.mainloop()

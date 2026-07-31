@@ -3,6 +3,8 @@ import logging
 from app.logging_config import configure_logging
 from app.admin_panel import AdminPanel
 from app.config_manager import is_config_complete, load_config, try_reconstruct_config
+from app.metadata import PRODUCT_NAME
+from app.ui_components import apply_app_icon, configure_styles
 from app.wizard import InstallWizard
 from tkinter import Tk
 
@@ -13,6 +15,9 @@ LOGGER = logging.getLogger(__name__)
 def launch() -> None:
     LOGGER.info("Inicio de Gestion Fiduciaria Server Manager")
     root = Tk()
+    root.title(PRODUCT_NAME)
+    configure_styles()
+    apply_app_icon(root)
 
     def clear_root() -> None:
         for child in root.winfo_children():

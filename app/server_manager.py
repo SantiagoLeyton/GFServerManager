@@ -73,28 +73,6 @@ def find_waitress_listener_pid(port: int, project_path: Path) -> int | None:
     return None
 
 
-def reconcile_waitress_pid(config: dict) -> int | None:
-    project_path_value = config.get("project_path")
-    if not project_path_value:
-        return None
-    project_path = Path(project_path_value)
-    try:
-        port = int(config.get("port", 8000))
-    except (TypeError, ValueError):
-        return None
-    listener_pid = find_waitress_listener_pid(port, project_path)
-    if listener_pid:
-        return listener_pid
-    pid = config.get("pid")
-    try:
-        pid = int(pid) if pid else None
-    except (TypeError, ValueError):
-        return None
-    if is_waitress_process(pid, project_path):
-        return pid
-    return None
-
-
 def process_exists(pid: int | None) -> bool:
     if not pid:
         return False

@@ -12,14 +12,12 @@ from .database_manager import test_connection
 from .django_manager import python_executable
 from .environment_manager import env_database_credentials, is_env_valid, read_env
 from .logging_config import app_root
+from .metadata import APP_VERSION
 from .project_validator import validate_project
 from .server_manager import SERVER_RUNNING, SERVER_STOPPED, get_server_status
 
 
 LOGGER = logging.getLogger(__name__)
-APP_VERSION = "Fase 3"
-
-
 @dataclass
 class DiagnosticItem:
     name: str
