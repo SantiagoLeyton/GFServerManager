@@ -12,8 +12,8 @@ from .config_manager import build_config, save_config
 from .database_manager import (
     AdminDatabaseCredentials,
     DatabaseCredentials,
-    check_connection,
     ensure_database,
+    require_connection,
 )
 from .django_manager import collectstatic, ensure_virtualenv, find_static_probe_url, install_dependencies, migrate
 from .environment_manager import build_env_values, write_env
@@ -231,9 +231,11 @@ class InstallWizard(ttk.Frame):
     def _test_database_clicked(self) -> None:
         try:
             self._set_busy(True, "Probando conexion a base de datos...")
-            credentials = self._database_credentials()
-            check_connection(credentials)
-            Dialogs.success("Base de datos", "Conexion comprobada correctamente.")
+            self._validate_database_inputs()
+            credentials, messages = self._prepare_database_for_current_mode()
+            require_connection(credentials)
+            message = "\n".join(messages + ["Conexion validada correctamente."])
+            Dialogs.success("Base de datos", message)
         except Exception as exc:
             Dialogs.error("Base de datos", str(exc))
         finally:
@@ -275,39 +277,12 @@ class InstallWizard(ttk.Frame):
             if not inspection.valid:
                 raise RuntimeError("\n".join(inspection.errors))
 
-            credentials = DatabaseCredentials(
-                host=str(snapshot["db_host"]),
-                port=int(snapshot["db_port"]),
-                database=str(snapshot["db_name"]),
-                user=str(snapshot["db_user"]),
-                password=str(snapshot["db_password"]),
-            )
-            if snapshot["db_mode"] == "create":
-                self._log("Preparando rol/base de datos...")
-                admin = AdminDatabaseCredentials(
-                    host=str(snapshot["db_host"]),
-                    port=int(snapshot["db_port"]),
-                    user=str(snapshot["admin_user"]),
-                    password=str(snapshot["admin_password"]),
-                )
-                messages = ensure_database(
-                    admin,
-                    str(snapshot["db_name"]),
-                    str(snapshot["owner_user"]),
-                    str(snapshot["owner_password"]),
-                )
-                for message in messages:
-                    self._log(message)
-                credentials = DatabaseCredentials(
-                    host=str(snapshot["db_host"]),
-                    port=int(snapshot["db_port"]),
-                    database=str(snapshot["db_name"]),
-                    user=str(snapshot["owner_user"]),
-                    password=str(snapshot["owner_password"]),
-                )
+            credentials, messages = self._prepare_database_for_snapshot(snapshot)
+            for message in messages:
+                self._log(message)
 
             self._log("Comprobando conexion a PostgreSQL...")
-            check_connection(credentials)
+            require_connection(credentials)
 
             self._log("Generando .env sin registrar secretos...")
             env_values = build_env_values(credentials, port)
@@ -382,10 +357,23 @@ class InstallWizard(ttk.Frame):
             raise ValueError("Las contrasenas de Comercial no coinciden.")
         if not self.accounting_password.get() or not self.commercial_password.get():
             raise ValueError("Digite las contrasenas iniciales.")
-        if self.db_mode.get() == "existing" and not self.db_password.get():
-            raise ValueError("Digite la contrasena de la base de datos.")
-        if self.db_mode.get() == "create" and (not self.admin_password.get() or not self.owner_password.get()):
-            raise ValueError("Digite las contrasenas de PostgreSQL necesarias.")
+        self._validate_database_inputs()
+
+    def _validate_database_inputs(self) -> None:
+        if not self.db_name.get().strip():
+            raise ValueError("Digite el nombre de la base de datos.")
+        if int(self.db_port.get()) < 1 or int(self.db_port.get()) > 65535:
+            raise ValueError("El puerto de PostgreSQL debe estar entre 1 y 65535.")
+        if self.db_mode.get() == "existing":
+            if not self.db_user.get().strip():
+                raise ValueError("Digite el usuario de la base de datos.")
+            if not self.db_password.get():
+                raise ValueError("Digite la contrasena de la base de datos.")
+        if self.db_mode.get() == "create":
+            if not self.admin_user.get().strip() or not self.owner_user.get().strip() or not self.db_name.get().strip():
+                raise ValueError("Digite administrador PostgreSQL, nuevo usuario owner y nombre de base de datos.")
+            if not self.admin_password.get() or not self.owner_password.get():
+                raise ValueError("Digite las contrasenas de PostgreSQL necesarias.")
 
     def _database_credentials(self) -> DatabaseCredentials:
         return DatabaseCredentials(
@@ -394,6 +382,71 @@ class InstallWizard(ttk.Frame):
             database=self.db_name.get().strip(),
             user=self.db_user.get().strip(),
             password=self.db_password.get(),
+        )
+
+    def _admin_database_credentials(self) -> AdminDatabaseCredentials:
+        return AdminDatabaseCredentials(
+            host=self.db_host.get().strip(),
+            port=int(self.db_port.get()),
+            user=self.admin_user.get().strip(),
+            password=self.admin_password.get(),
+        )
+
+    def _owner_database_credentials(self) -> DatabaseCredentials:
+        return DatabaseCredentials(
+            host=self.db_host.get().strip(),
+            port=int(self.db_port.get()),
+            database=self.db_name.get().strip(),
+            user=self.owner_user.get().strip(),
+            password=self.owner_password.get(),
+        )
+
+    def _prepare_database_for_current_mode(self) -> tuple[DatabaseCredentials, list[str]]:
+        if self.db_mode.get() == "existing":
+            return self._database_credentials(), []
+        admin = self._admin_database_credentials()
+        messages = ensure_database(
+            admin,
+            self.db_name.get().strip(),
+            self.owner_user.get().strip(),
+            self.owner_password.get(),
+        )
+        return self._owner_database_credentials(), messages
+
+    def _prepare_database_for_snapshot(self, snapshot: dict[str, object]) -> tuple[DatabaseCredentials, list[str]]:
+        if snapshot["db_mode"] == "existing":
+            return (
+                DatabaseCredentials(
+                    host=str(snapshot["db_host"]),
+                    port=int(snapshot["db_port"]),
+                    database=str(snapshot["db_name"]),
+                    user=str(snapshot["db_user"]),
+                    password=str(snapshot["db_password"]),
+                ),
+                [],
+            )
+        self._log("Preparando rol/base de datos...")
+        admin = AdminDatabaseCredentials(
+            host=str(snapshot["db_host"]),
+            port=int(snapshot["db_port"]),
+            user=str(snapshot["admin_user"]),
+            password=str(snapshot["admin_password"]),
+        )
+        messages = ensure_database(
+            admin,
+            str(snapshot["db_name"]),
+            str(snapshot["owner_user"]),
+            str(snapshot["owner_password"]),
+        )
+        return (
+            DatabaseCredentials(
+                host=str(snapshot["db_host"]),
+                port=int(snapshot["db_port"]),
+                database=str(snapshot["db_name"]),
+                user=str(snapshot["owner_user"]),
+                password=str(snapshot["owner_password"]),
+            ),
+            messages,
         )
 
     def _installation_snapshot(self) -> dict[str, object]:
