@@ -19,7 +19,7 @@ from .django_manager import collectstatic, ensure_virtualenv, find_static_probe_
 from .environment_manager import build_env_values, write_env
 from .project_validator import validate_project
 from .requirements_checker import check_requirements
-from .server_manager import start_waitress, wait_for_http, wait_for_static_file
+from .server_manager import find_waitress_listener_pid, start_waitress, wait_for_http, wait_for_static_file
 from .user_manager import InitialUser, create_or_update_initial_users
 
 
@@ -27,12 +27,16 @@ LOGGER = logging.getLogger(__name__)
 
 
 class InstallWizard(ttk.Frame):
-    def __init__(self, master: Tk) -> None:
+    def __init__(self, master: Tk, on_complete=None, on_cancel=None) -> None:
         super().__init__(master, padding=16)
         self.master = master
+        self.on_complete = on_complete
+        self.on_cancel = on_cancel
         self.queue: queue.Queue[tuple[str, str]] = queue.Queue()
         self.confirm_queue: queue.Queue[bool] = queue.Queue()
         self.running = False
+        self._closed = False
+        self._poll_after_id: str | None = None
 
         self.project_path = StringVar(value=str((Path.cwd().parent / "PagosFiducia").resolve()))
         self.db_mode = StringVar(value="existing")
@@ -55,7 +59,7 @@ class InstallWizard(ttk.Frame):
         self.update_existing_passwords = BooleanVar(value=False)
 
         self._build()
-        self._poll_queue()
+        self._schedule_poll()
         self._run_requirement_check()
 
     def _build(self) -> None:
@@ -166,6 +170,10 @@ class InstallWizard(ttk.Frame):
 
         self.install_button = ttk.Button(self.run_tab, text="Instalar y arrancar", command=self._install_clicked)
         self.install_button.grid(row=2, column=0, sticky="w")
+        if self.on_cancel:
+            ttk.Button(self.run_tab, text="Cancelar reinstalacion", command=self._cancel_clicked).grid(
+                row=2, column=0, sticky="w", padx=(150, 0)
+            )
 
         self.output = scrolledtext.ScrolledText(self.run_tab, height=26, wrap="word")
         self.output.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
@@ -211,62 +219,73 @@ class InstallWizard(ttk.Frame):
             return
         try:
             self._validate_inputs()
+            snapshot = self._installation_snapshot()
+            env_path = Path(snapshot["project_path"]) / ".env"
+            snapshot["backup_existing"] = False
+            if env_path.exists():
+                accepted = messagebox.askyesno(
+                    ".env existente",
+                    "Ya existe un archivo .env. Se creara un respaldo con fecha y hora antes de sobrescribirlo. Desea continuar?",
+                )
+                if not accepted:
+                    messagebox.showinfo("Instalacion", "Instalacion cancelada para no sobrescribir .env.")
+                    return
+                snapshot["backup_existing"] = True
         except Exception as exc:
             messagebox.showerror("Validacion", str(exc))
             return
         self.running = True
         self.install_button.configure(state="disabled")
-        thread = threading.Thread(target=self._install_worker, daemon=True)
+        thread = threading.Thread(target=self._install_worker, args=(snapshot,), daemon=True)
         thread.start()
 
-    def _install_worker(self) -> None:
+    def _install_worker(self, snapshot: dict[str, object]) -> None:
+        success = False
         try:
-            project_path = Path(self.project_path.get()).resolve()
-            port = int(self.port.get())
+            project_path = Path(str(snapshot["project_path"])).resolve()
+            port = int(snapshot["port"])
             self._log("Validando proyecto...")
             inspection = validate_project(project_path)
             if not inspection.valid:
                 raise RuntimeError("\n".join(inspection.errors))
 
-            credentials = self._database_credentials()
-            if self.db_mode.get() == "create":
+            credentials = DatabaseCredentials(
+                host=str(snapshot["db_host"]),
+                port=int(snapshot["db_port"]),
+                database=str(snapshot["db_name"]),
+                user=str(snapshot["db_user"]),
+                password=str(snapshot["db_password"]),
+            )
+            if snapshot["db_mode"] == "create":
                 self._log("Preparando rol/base de datos...")
                 admin = AdminDatabaseCredentials(
-                    host=self.db_host.get().strip(),
-                    port=int(self.db_port.get()),
-                    user=self.admin_user.get().strip(),
-                    password=self.admin_password.get(),
+                    host=str(snapshot["db_host"]),
+                    port=int(snapshot["db_port"]),
+                    user=str(snapshot["admin_user"]),
+                    password=str(snapshot["admin_password"]),
                 )
                 messages = ensure_database(
                     admin,
-                    self.db_name.get().strip(),
-                    self.owner_user.get().strip(),
-                    self.owner_password.get(),
+                    str(snapshot["db_name"]),
+                    str(snapshot["owner_user"]),
+                    str(snapshot["owner_password"]),
                 )
                 for message in messages:
                     self._log(message)
                 credentials = DatabaseCredentials(
-                    host=self.db_host.get().strip(),
-                    port=int(self.db_port.get()),
-                    database=self.db_name.get().strip(),
-                    user=self.owner_user.get().strip(),
-                    password=self.owner_password.get(),
+                    host=str(snapshot["db_host"]),
+                    port=int(snapshot["db_port"]),
+                    database=str(snapshot["db_name"]),
+                    user=str(snapshot["owner_user"]),
+                    password=str(snapshot["owner_password"]),
                 )
 
             self._log("Comprobando conexion a PostgreSQL...")
             check_connection(credentials)
 
-            env_path = project_path / ".env"
-            backup_existing = False
-            if env_path.exists():
-                self._ask_env_confirmation()
-                if not self.confirm_queue.get():
-                    raise RuntimeError("Instalacion cancelada para no sobrescribir .env.")
-                backup_existing = True
-
             self._log("Generando .env sin registrar secretos...")
             env_values = build_env_values(credentials, port)
-            env_result = write_env(project_path, env_values, backup_existing=backup_existing)
+            env_result = write_env(project_path, env_values, backup_existing=bool(snapshot["backup_existing"]))
             if env_result.backup_path:
                 self._log(f"Respaldo creado: {env_result.backup_path.name}")
 
@@ -283,14 +302,18 @@ class InstallWizard(ttk.Frame):
             user_output = create_or_update_initial_users(
                 project_path,
                 venv,
-                self._initial_users(),
-                update_existing=self.update_existing_passwords.get(),
+                self._initial_users(snapshot),
+                update_existing=bool(snapshot["update_existing_passwords"]),
             )
             if user_output:
                 self._log(user_output)
 
-            self._log("Iniciando Waitress...")
-            process = start_waitress(project_path, venv, port)
+            server_pid = find_waitress_listener_pid(port, project_path)
+            if server_pid:
+                self._log("Waitress ya esta ejecutandose; se reutilizara el proceso activo.")
+            else:
+                self._log("Iniciando Waitress...")
+                process = start_waitress(project_path, venv, port)
             self._log("Verificando respuesta HTTP local...")
             if not wait_for_http(port):
                 raise RuntimeError("Waitress inicio, pero la aplicacion no respondio en el tiempo esperado.")
@@ -298,28 +321,22 @@ class InstallWizard(ttk.Frame):
             if not wait_for_static_file(port, static_probe_url):
                 raise RuntimeError("La aplicacion respondio, pero no se pudo servir un archivo estatico real.")
 
-            config = build_config(project_path, venv, port, pid=process.pid)
+            server_pid = find_waitress_listener_pid(port, project_path) or server_pid
+            if not server_pid:
+                raise RuntimeError("No se pudo identificar el PID de Waitress despues del inicio.")
+            config = build_config(project_path, venv, port, pid=server_pid)
             save_config(config)
             self._log("")
             self._log("Instalacion finalizada correctamente.")
             self._log(f"URL por IP: http://{config.ipv4}:{port}")
             self._log(f"URL por hostname: http://{config.hostname}:{port}")
             self._log("Recuerde permitir el puerto en el Firewall de Windows para acceso desde otros equipos.")
+            success = True
         except Exception as exc:
             LOGGER.exception("Fallo la instalacion de Fase 1")
             self._log(f"ERROR: {exc}")
         finally:
-            self.queue.put(("done", ""))
-
-    def _ask_env_confirmation(self) -> None:
-        def ask() -> None:
-            accepted = messagebox.askyesno(
-                ".env existente",
-                "Ya existe un archivo .env. Se creara un respaldo con fecha y hora antes de sobrescribirlo. Desea continuar?",
-            )
-            self.confirm_queue.put(accepted)
-
-        self.master.after(0, ask)
+            self.queue.put(("done", "success" if success else "failed"))
 
     def _validate_inputs(self) -> None:
         if not self.project_path.get().strip():
@@ -352,45 +369,116 @@ class InstallWizard(ttk.Frame):
             password=self.db_password.get(),
         )
 
-    def _initial_users(self) -> list[InitialUser]:
+    def _installation_snapshot(self) -> dict[str, object]:
+        return {
+            "project_path": self.project_path.get().strip(),
+            "db_mode": self.db_mode.get(),
+            "db_host": self.db_host.get().strip(),
+            "db_port": int(self.db_port.get()),
+            "db_name": self.db_name.get().strip(),
+            "db_user": self.db_user.get().strip(),
+            "db_password": self.db_password.get(),
+            "admin_user": self.admin_user.get().strip(),
+            "admin_password": self.admin_password.get(),
+            "owner_user": self.owner_user.get().strip(),
+            "owner_password": self.owner_password.get(),
+            "port": int(self.port.get()),
+            "accounting_email": self.accounting_email.get().strip().lower(),
+            "accounting_password": self.accounting_password.get(),
+            "commercial_email": self.commercial_email.get().strip().lower(),
+            "commercial_password": self.commercial_password.get(),
+            "update_existing_passwords": self.update_existing_passwords.get(),
+        }
+
+    def _initial_users(self, snapshot: dict[str, object]) -> list[InitialUser]:
         return [
             InitialUser(
                 label="Contabilidad",
-                username=_username_from_email(self.accounting_email.get()),
-                email=self.accounting_email.get().strip().lower(),
-                password=self.accounting_password.get(),
+                username=_username_from_email(str(snapshot["accounting_email"])),
+                email=str(snapshot["accounting_email"]),
+                password=str(snapshot["accounting_password"]),
                 role="accounting_admin",
             ),
             InitialUser(
                 label="Comercial",
-                username=_username_from_email(self.commercial_email.get()),
-                email=self.commercial_email.get().strip().lower(),
-                password=self.commercial_password.get(),
+                username=_username_from_email(str(snapshot["commercial_email"])),
+                email=str(snapshot["commercial_email"]),
+                password=str(snapshot["commercial_password"]),
                 role="commercial",
             ),
         ]
 
+    def _schedule_poll(self) -> None:
+        if self._closed or self._poll_after_id is not None or not self._widget_exists(self.master):
+            return
+        self._poll_after_id = self.master.after(150, self._poll_queue)
+
     def _poll_queue(self) -> None:
+        self._poll_after_id = None
+        if self._closed or not self._widget_exists(self):
+            return
         try:
             while True:
                 item_type, payload = self.queue.get_nowait()
                 if item_type == "log":
-                    self.output.insert("end", payload + "\n")
-                    self.output.see("end")
+                    if self._widget_exists(self.output):
+                        self.output.insert("end", payload + "\n")
+                        self.output.see("end")
                 elif item_type == "done":
                     self.running = False
-                    self.install_button.configure(state="normal")
+                    if self._widget_exists(self.install_button):
+                        self.install_button.configure(state="normal")
+                    if payload == "success":
+                        self._finish_success()
+                        return
         except queue.Empty:
             pass
-        self.master.after(150, self._poll_queue)
+        self._schedule_poll()
+
+    def _finish_success(self) -> None:
+        if self.on_complete:
+            self._dispose()
+            self.on_complete()
+
+    def _cancel_clicked(self) -> None:
+        if self.running:
+            messagebox.showwarning("Reinstalacion", "No se puede cancelar mientras la instalacion esta en ejecucion.")
+            return
+        if self.on_cancel:
+            self._dispose()
+            self.on_cancel()
 
     def _log(self, message: str) -> None:
         LOGGER.info(_sanitize(message))
         self.queue.put(("log", message))
 
     def _write_project_status(self, text: str) -> None:
-        self.project_status.delete("1.0", "end")
-        self.project_status.insert("end", text)
+        if self._widget_exists(self.project_status):
+            self.project_status.delete("1.0", "end")
+            self.project_status.insert("end", text)
+
+    def _dispose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._poll_after_id and self._widget_exists(self.master):
+            try:
+                self.master.after_cancel(self._poll_after_id)
+            except Exception:
+                LOGGER.debug("No se pudo cancelar callback after del asistente", exc_info=True)
+        self._poll_after_id = None
+
+    def destroy(self) -> None:
+        self._dispose()
+        super().destroy()
+
+    def _widget_exists(self, widget) -> bool:
+        if widget is None:
+            return False
+        try:
+            return bool(widget.winfo_exists())
+        except Exception:
+            return False
 
 
 def _username_from_email(email: str) -> str:

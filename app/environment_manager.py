@@ -40,6 +40,37 @@ def build_env_values(credentials: DatabaseCredentials, port: int) -> dict[str, s
     }
 
 
+def read_env(project_path: Path) -> dict[str, str]:
+    env_path = project_path / ".env"
+    if not env_path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = _unquote_env_value(value.strip())
+    return values
+
+
+def env_database_credentials(project_path: Path) -> DatabaseCredentials:
+    values = read_env(project_path)
+    return DatabaseCredentials(
+        host=values.get("DB_HOST", "localhost"),
+        port=int(values.get("DB_PORT", "5432") or "5432"),
+        database=values.get("DB_NAME", ""),
+        user=values.get("DB_USER", ""),
+        password=values.get("DB_PASSWORD", ""),
+    )
+
+
+def is_env_valid(project_path: Path) -> bool:
+    values = read_env(project_path)
+    required = ["DJANGO_SECRET_KEY", "DJANGO_DEBUG", "DJANGO_ALLOWED_HOSTS", "DB_NAME", "DB_USER", "DB_HOST", "DB_PORT"]
+    return all(values.get(key) for key in required)
+
+
 def write_env(project_path: Path, values: dict[str, str], backup_existing: bool) -> EnvWriteResult:
     env_path = project_path / ".env"
     backup_path = None
@@ -67,6 +98,12 @@ def _format_env_value(value: str) -> str:
     return value
 
 
+def _unquote_env_value(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        return value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return value
+
+
 def _unique(values: list[str]) -> list[str]:
     result: list[str] = []
     for value in values:
@@ -74,4 +111,3 @@ def _unique(values: list[str]) -> list[str]:
         if value and value not in result:
             result.append(value)
     return result
-

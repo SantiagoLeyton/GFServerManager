@@ -54,6 +54,33 @@ def load_config() -> dict[str, Any] | None:
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
+def update_config(values: dict[str, Any]) -> dict[str, Any]:
+    config = load_config() or {}
+    config.update(values)
+    CONFIG_PATH.parent.mkdir(exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    return config
+
+
+def is_config_complete(config: dict[str, Any] | None) -> bool:
+    if not config:
+        return False
+    required = ["project_path", "venv_path", "wsgi_module", "host", "port", "installation_status"]
+    if any(not config.get(key) for key in required):
+        return False
+    if config.get("installation_status") != "installed":
+        return False
+    project_path = Path(config["project_path"])
+    venv_path = Path(config["venv_path"])
+    return (
+        project_path.exists()
+        and (project_path / "manage.py").exists()
+        and (project_path / ".env").exists()
+        and venv_path.exists()
+        and (venv_path / "Scripts" / "python.exe").exists()
+    )
+
+
 def build_config(project_path: Path, venv_path: Path, port: int, pid: int | None = None) -> ServerConfig:
     return ServerConfig(
         project_path=str(project_path.resolve()),
@@ -67,4 +94,3 @@ def build_config(project_path: Path, venv_path: Path, port: int, pid: int | None
         installation_status="installed",
         pid=pid,
     )
-

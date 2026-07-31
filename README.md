@@ -15,7 +15,22 @@ Incluye solamente el asistente de instalacion inicial:
 - guarda configuracion no sensible en `data/server_manager.json`;
 - escribe registros en `logs/server_manager.log` sin credenciales.
 
-No incluye panel administrativo, instalador, empaquetado, autoarranque, firewall automatico, copias de seguridad ni actualizacion automatica.
+No incluye instalador, empaquetado, autoarranque, firewall automatico, copias de seguridad ni actualizacion automatica.
+
+## Fase 2
+
+Cuando existe una instalacion valida en `data/server_manager.json`, la aplicacion abre directamente el panel de administracion diario.
+
+El panel incluye:
+
+- Inicio con estado general y acciones rapidas.
+- Servidor con PID, puerto, tiempo de ejecucion e inicio/detencion/reinicio de Waitress.
+- Base de datos en modo consulta y prueba de conexion.
+- Usuarios con lectura desde Django, creacion, cambio de contrasena y activacion/inactivacion.
+- Configuracion local con edicion limitada de host y puerto.
+- Logs con lectura automatica de `logs/server_manager.log`.
+
+Cerrar la ventana no detiene Waitress automaticamente. Si el servidor esta activo, se pregunta si se desea mantenerlo en segundo plano, detenerlo o cancelar la salida.
 
 ## Uso
 
@@ -32,4 +47,3 @@ python main.py
 ```
 
 El puerto predeterminado es `8000`. Para acceso desde otros equipos, el Firewall de Windows debe permitir conexiones entrantes a ese puerto.
-

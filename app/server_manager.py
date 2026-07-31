@@ -27,14 +27,82 @@ def find_process_on_port(port: int) -> str | None:
     for proc in psutil.process_iter(["pid", "name"]):
         try:
             for conn in proc.net_connections(kind="inet"):
-                if conn.laddr and conn.laddr.port == port:
+                if conn.status == psutil.CONN_LISTEN and conn.laddr and conn.laddr.port == port:
                     return f"{proc.info['name']} (PID {proc.info['pid']})"
         except (psutil.Error, PermissionError):
             continue
     return None
 
 
-def start_waitress(project_path: Path, venv: Path, port: int) -> subprocess.Popen:
+def find_waitress_listener_pid(port: int, project_path: Path) -> int | None:
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            command = " ".join(proc.cmdline()).lower()
+            if "waitress" not in command or "config.wsgi:application" not in command:
+                continue
+            try:
+                if Path(proc.cwd()).resolve() != project_path.resolve():
+                    continue
+            except (psutil.Error, OSError):
+                continue
+            for conn in proc.net_connections(kind="inet"):
+                if conn.status == psutil.CONN_LISTEN and conn.laddr and conn.laddr.port == port:
+                    return int(proc.info["pid"])
+        except (psutil.Error, PermissionError):
+            continue
+    return None
+
+
+def process_exists(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        proc = psutil.Process(pid)
+        return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+    except psutil.Error:
+        return False
+
+
+def process_start_time(pid: int | None) -> float | None:
+    if not process_exists(pid):
+        return None
+    try:
+        return psutil.Process(pid).create_time()
+    except psutil.Error:
+        return None
+
+
+def is_waitress_process(pid: int | None, project_path: Path | None = None) -> bool:
+    if not process_exists(pid):
+        return False
+    try:
+        proc = psutil.Process(pid)
+        command = " ".join(proc.cmdline()).lower()
+        if "waitress" not in command or "config.wsgi:application" not in command:
+            return False
+        if project_path is None:
+            return True
+        try:
+            return Path(proc.cwd()).resolve() == project_path.resolve()
+        except (psutil.Error, OSError):
+            return True
+    except psutil.Error:
+        return False
+
+
+def stop_process(pid: int | None, timeout_seconds: int = 10) -> bool:
+    if not process_exists(pid):
+        return True
+    proc = psutil.Process(pid)
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout_seconds)
+        return True
+    except psutil.TimeoutExpired:
+        return False
+
+
+def start_waitress(project_path: Path, venv: Path, port: int, host: str = "0.0.0.0") -> subprocess.Popen:
     if not is_port_available(port):
         process = find_process_on_port(port)
         detail = f" Lo usa {process}." if process else ""
@@ -44,7 +112,7 @@ def start_waitress(project_path: Path, venv: Path, port: int) -> subprocess.Pope
         str(python_executable(venv)),
         "-m",
         "waitress",
-        "--host=0.0.0.0",
+        f"--host={host}",
         f"--port={port}",
         "config.wsgi:application",
     ]
