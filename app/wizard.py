@@ -328,6 +328,7 @@ class InstallWizard(ttk.Frame):
             save_config(config)
             self._log("")
             self._log("Instalacion finalizada correctamente.")
+            LOGGER.info("Instalacion/reinstalacion finalizada correctamente para %s", project_path)
             self._log(f"URL por IP: http://{config.ipv4}:{port}")
             self._log(f"URL por hostname: http://{config.hostname}:{port}")
             self._log("Recuerde permitir el puerto en el Firewall de Windows para acceso desde otros equipos.")

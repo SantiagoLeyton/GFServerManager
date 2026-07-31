@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .django_manager import django_shell
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -18,6 +22,7 @@ class InitialUser:
 
 
 def create_or_update_initial_users(project_path: Path, venv: Path, users: list[InitialUser], update_existing: bool) -> str:
+    LOGGER.info("Creando o actualizando usuarios iniciales: %s", ", ".join(user.email for user in users))
     payload = json.dumps(
         {
             "update_existing": update_existing,
@@ -96,6 +101,7 @@ print(json.dumps(rows, ensure_ascii=False))
 
 
 def create_user(project_path: Path, venv: Path, data: dict[str, str]) -> str:
+    LOGGER.info("Creando usuario %s", data.get("email", "sin-correo"))
     payload = json.dumps(data)
     code = r"""
 import json
@@ -128,6 +134,7 @@ print("Usuario creado.")
 
 
 def change_password(project_path: Path, venv: Path, user_id: int, password: str) -> str:
+    LOGGER.info("Cambiando contrasena de usuario id=%s", user_id)
     payload = json.dumps({"user_id": user_id, "password": password})
     code = r"""
 import json
@@ -148,6 +155,7 @@ print("Contrasena actualizada.")
 
 
 def set_user_active(project_path: Path, venv: Path, user_id: int, active: bool) -> str:
+    LOGGER.info("Actualizando estado de usuario id=%s active=%s", user_id, active)
     payload = json.dumps({"user_id": user_id, "active": active})
     code = r"""
 import json

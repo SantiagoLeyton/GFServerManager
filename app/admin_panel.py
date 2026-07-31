@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import threading
-import time
 import webbrowser
 from pathlib import Path
 from tkinter import IntVar, StringVar, Tk, Toplevel, messagebox
@@ -11,17 +10,16 @@ from tkinter import scrolledtext
 from tkinter import ttk
 
 from .config_manager import detect_hostname, detect_local_ipv4, load_config, update_config
-from .database_manager import check_connection
+from .database_manager import test_connection
+from .diagnostics import DiagnosticReport, export_diagnostics, level_icon, run_diagnostics
 from .django_manager import find_static_probe_url
 from .environment_manager import env_database_credentials, is_env_valid, read_env
 from .logging_config import app_root
 from .project_validator import validate_project
 from .server_manager import (
-    find_process_on_port,
-    find_waitress_listener_pid,
+    get_server_status,
     is_waitress_process,
     process_exists,
-    process_start_time,
     start_waitress,
     stop_process,
     wait_for_http,
@@ -49,6 +47,8 @@ class AdminPanel(ttk.Frame):
         self.config_vars: dict[str, StringVar | IntVar] = {}
         self.users_tree: ttk.Treeview | None = None
         self.logs_text: scrolledtext.ScrolledText | None = None
+        self.diagnostics_tree: ttk.Treeview | None = None
+        self.diagnostics_report: DiagnosticReport | None = None
 
         self._refresh_after_id: str | None = None
         self._logs_after_id: str | None = None
@@ -120,7 +120,7 @@ class AdminPanel(ttk.Frame):
             font=("Segoe UI", 13, "bold"),
         ).pack(anchor="w", pady=(0, 18))
 
-        for section in ["Inicio", "Servidor", "Base de datos", "Usuarios", "Configuración", "Logs"]:
+        for section in ["Inicio", "Servidor", "Base de datos", "Usuarios", "Configuración", "Logs", "Diagnóstico"]:
             ttk.Button(sidebar, text=section, command=lambda name=section: self._show_section(name)).pack(
                 fill="x", pady=4
             )
@@ -154,6 +154,7 @@ class AdminPanel(ttk.Frame):
             "Usuarios": self._build_users,
             "Configuración": self._build_configuration,
             "Logs": self._build_logs,
+            "Diagnóstico": self._build_diagnostics,
         }
         builders[name](container)
         self._refresh_status()
@@ -166,6 +167,7 @@ class AdminPanel(ttk.Frame):
         self.config_vars.clear()
         self.users_tree = None
         self.logs_text = None
+        self.diagnostics_tree = None
 
     def _build_home(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -305,6 +307,28 @@ class AdminPanel(ttk.Frame):
         )
         self._refresh_logs()
 
+    def _build_diagnostics(self, parent: ttk.Frame) -> None:
+        parent.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
+        columns = ("status", "item", "message")
+        self.diagnostics_tree = ttk.Treeview(parent, columns=columns, show="headings")
+        self.diagnostics_tree.heading("status", text="Estado")
+        self.diagnostics_tree.heading("item", text="Elemento")
+        self.diagnostics_tree.heading("message", text="Resultado")
+        self.diagnostics_tree.column("status", width=90, anchor="center")
+        self.diagnostics_tree.column("item", width=180, anchor="w")
+        self.diagnostics_tree.column("message", width=650, anchor="w")
+        self.diagnostics_tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=self.diagnostics_tree.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.diagnostics_tree.configure(yscrollcommand=scrollbar.set)
+
+        buttons = ttk.Frame(parent)
+        buttons.grid(row=1, column=0, sticky="w", pady=(12, 0))
+        ttk.Button(buttons, text="Ejecutar diagnóstico", command=self._run_diagnostics_clicked).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="Exportar diagnóstico", command=self._export_diagnostics_clicked).pack(side="left", padx=8)
+        self._run_diagnostics_clicked()
+
     def _card(self, parent: ttk.Frame, title: str) -> ttk.Frame:
         frame = ttk.Frame(parent, padding=14, style="Card.TFrame")
         ttk.Label(frame, text=title, style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
@@ -328,8 +352,9 @@ class AdminPanel(ttk.Frame):
     def _refresh_status(self) -> None:
         if self._closed or not self._widget_exists(self):
             return
-        self.config = load_config() or self.config
-        statuses = self._status_snapshot()
+        self.config = self._reconciled_config()
+        server_status = get_server_status(self.config)
+        statuses = self._status_snapshot(server_status)
 
         if self.current_section == "Inicio":
             for label, ok in statuses.items():
@@ -339,18 +364,15 @@ class AdminPanel(ttk.Frame):
             self._set_label(self.info_labels.get("Puerto"), self._value_or_na(str(self.port)))
             self._set_label(self.info_labels.get("Dirección IP"), self._value_or_na(self.config.get("ipv4") or detect_local_ipv4()))
             self._set_label(self.info_labels.get("Hostname"), self._value_or_na(self.config.get("hostname") or detect_hostname()))
-            self._set_label(self.info_labels.get("Tiempo desde el último inicio"), self._value_or_na(self._uptime_text()))
+            self._set_label(self.info_labels.get("Tiempo desde el último inicio"), self._value_or_na(server_status.uptime))
 
         if self.current_section == "Servidor":
-            running = is_waitress_process(self.pid, self.project_path)
-            self._set_label(self.server_labels.get("Estado"), "Ejecutándose" if running else "Detenido")
-            self._set_label(self.server_labels.get("PID"), str(self.pid) if running else NOT_AVAILABLE)
-            self._set_label(self.server_labels.get("Host"), self._value_or_na(self.host))
-            self._set_label(self.server_labels.get("Puerto"), self._value_or_na(str(self.port)))
-            self._set_label(self.server_labels.get("Tiempo de ejecución"), self._value_or_na(self._uptime_text()))
-            self._set_label(self.server_labels.get("Proceso en puerto"), self._value_or_na(find_process_on_port(self.port)))
-            if self.pid and not running and not process_exists(self.pid):
-                self.config = update_config({"pid": None})
+            self._set_label(self.server_labels.get("Estado"), server_status.state)
+            self._set_label(self.server_labels.get("PID"), str(server_status.pid) if server_status.pid else NOT_AVAILABLE)
+            self._set_label(self.server_labels.get("Host"), self._value_or_na(server_status.host))
+            self._set_label(self.server_labels.get("Puerto"), server_status.port_message)
+            self._set_label(self.server_labels.get("Tiempo de ejecución"), self._value_or_na(server_status.uptime))
+            self._set_label(self.server_labels.get("Proceso en puerto"), server_status.process_message)
 
         if self.current_section == "Base de datos":
             env = self._safe_read_env()
@@ -363,7 +385,10 @@ class AdminPanel(ttk.Frame):
                 "Conectada" if statuses["Base de datos conectada"] else "Sin conexión",
             )
 
-    def _status_snapshot(self) -> dict[str, bool]:
+        if self.current_section == "Diagnóstico":
+            self._run_diagnostics_clicked()
+
+    def _status_snapshot(self, server_status=None) -> dict[str, bool]:
         project_ok = False
         env_ok = False
         db_ok = False
@@ -382,8 +407,9 @@ class AdminPanel(ttk.Frame):
         except Exception:
             LOGGER.exception("No se pudo comprobar la base de datos")
         try:
-            waitress_ok = is_waitress_process(self.pid, self.project_path)
-            app_ok = wait_for_http(self.port, timeout_seconds=1) if waitress_ok else False
+            server_status = server_status or get_server_status(self.config)
+            waitress_ok = server_status.running
+            app_ok = wait_for_http(server_status.port, timeout_seconds=1) if waitress_ok else False
         except Exception:
             LOGGER.exception("No se pudo comprobar el estado de Waitress")
         return {
@@ -396,9 +422,14 @@ class AdminPanel(ttk.Frame):
 
     def _database_ok(self, silent: bool = False) -> bool:
         try:
-            check_connection(env_database_credentials(self.project_path))
+            result = test_connection(env_database_credentials(self.project_path))
+            if not result.ok:
+                if not silent:
+                    self._set_label(self.db_labels.get("Estado de conexión"), f"{result.message} ({result.elapsed_ms} ms)")
+                    messagebox.showerror("Base de datos", result.message)
+                return False
             if not silent:
-                self._set_label(self.db_labels.get("Estado de conexión"), "Conectada")
+                self._set_label(self.db_labels.get("Estado de conexión"), f"Conectada ({result.elapsed_ms} ms)")
             return True
         except Exception as exc:
             if silent:
@@ -417,9 +448,14 @@ class AdminPanel(ttk.Frame):
         self._run_background(self._start_server_worker, "Servidor")
 
     def _start_server_worker(self) -> None:
-        if is_waitress_process(self.pid, self.project_path):
-            self._info("Servidor", "Waitress ya está ejecutándose.")
+        server_status = get_server_status(self.config)
+        if server_status.running:
+            self.config = update_config({"pid": server_status.pid, "ipv4": detect_local_ipv4(), "hostname": detect_hostname()})
+            LOGGER.info("Waitress ya estaba ejecutandose; se reutiliza PID %s", server_status.pid)
+            self._info("Servidor", f"Waitress ya está ejecutándose con PID {server_status.pid}.")
             return
+        if server_status.conflict_message:
+            raise RuntimeError(server_status.conflict_message)
         if self.pid and process_exists(self.pid):
             raise RuntimeError("El PID almacenado existe, pero no corresponde al Waitress de Gestion Fiduciaria.")
         static_url = find_static_probe_url(self.project_path, self.venv_path)
@@ -428,35 +464,43 @@ class AdminPanel(ttk.Frame):
             raise RuntimeError("Waitress inició, pero la aplicación no respondió.")
         if not wait_for_static_file(self.port, static_url):
             raise RuntimeError("La aplicación respondió, pero no sirvió archivos estáticos.")
-        listener_pid = find_waitress_listener_pid(self.port, self.project_path) or process.pid
-        self.config = update_config({"pid": listener_pid, "ipv4": detect_local_ipv4(), "hostname": detect_hostname()})
+        server_status = get_server_status(self.config)
+        pid = server_status.pid or process.pid
+        self.config = update_config({"pid": pid, "ipv4": detect_local_ipv4(), "hostname": detect_hostname()})
+        LOGGER.info("Waitress iniciado con PID %s en puerto %s", pid, self.port)
         self._info("Servidor", "Servidor iniciado correctamente.")
 
     def _stop_server(self) -> None:
         self._run_background(self._stop_server_worker, "Servidor")
 
     def _stop_server_worker(self) -> None:
-        if not process_exists(self.pid):
+        server_status = get_server_status(self.config)
+        target_pid = server_status.pid or self.pid
+        if not process_exists(target_pid):
             self.config = update_config({"pid": None})
             self._info("Servidor", "No hay un proceso Waitress activo registrado.")
             return
-        if not is_waitress_process(self.pid, self.project_path):
+        if not is_waitress_process(target_pid, self.project_path):
             raise RuntimeError("El PID almacenado existe, pero no corresponde al Waitress de Gestion Fiduciaria.")
-        if not stop_process(self.pid):
+        if not stop_process(target_pid):
             raise RuntimeError("No se pudo detener el proceso Waitress dentro del tiempo esperado.")
         self.config = update_config({"pid": None})
+        LOGGER.info("Waitress detenido")
         self._info("Servidor", "Servidor detenido correctamente.")
 
     def _restart_server(self) -> None:
         self._run_background(self._restart_server_worker, "Servidor")
 
     def _restart_server_worker(self) -> None:
-        if process_exists(self.pid):
-            if not is_waitress_process(self.pid, self.project_path):
+        server_status = get_server_status(self.config)
+        target_pid = server_status.pid or self.pid
+        if process_exists(target_pid):
+            if not is_waitress_process(target_pid, self.project_path):
                 raise RuntimeError("El PID almacenado existe, pero no corresponde al Waitress de Gestion Fiduciaria.")
-            if not stop_process(self.pid):
+            if not stop_process(target_pid):
                 raise RuntimeError("No se pudo detener el proceso Waitress para reiniciar.")
             self.config = update_config({"pid": None})
+        LOGGER.info("Reiniciando Waitress")
         self._start_server_worker()
 
     def _load_users(self) -> None:
@@ -537,6 +581,7 @@ class AdminPanel(ttk.Frame):
             if port < 1024 or port > 65535:
                 raise ValueError("El puerto debe estar entre 1024 y 65535.")
             self.config = update_config({"host": host, "port": port})
+            LOGGER.info("Configuracion actualizada: host=%s port=%s", host, port)
             messagebox.showinfo("Configuración", "Host y puerto guardados. Reinicie el servidor para aplicar cambios.")
         except Exception as exc:
             messagebox.showerror("Configuración", str(exc))
@@ -566,6 +611,24 @@ class AdminPanel(ttk.Frame):
         self.logs_text.insert("end", content)
         self.logs_text.see("end")
 
+    def _run_diagnostics_clicked(self) -> None:
+        self.diagnostics_report = run_diagnostics(load_config())
+        if not self._widget_exists(self.diagnostics_tree):
+            return
+        self.diagnostics_tree.delete(*self.diagnostics_tree.get_children())
+        for item in self.diagnostics_report.items:
+            self.diagnostics_tree.insert("", "end", values=(level_icon(item.level), item.name, item.message))
+        LOGGER.info("Diagnostico ejecutado: %s", self.diagnostics_report.overall_message)
+
+    def _export_diagnostics_clicked(self) -> None:
+        try:
+            report = self.diagnostics_report or run_diagnostics(load_config())
+            path = export_diagnostics(report)
+            messagebox.showinfo("Diagnóstico", f"Diagnóstico exportado en:\n{path}")
+        except Exception as exc:
+            LOGGER.exception("No se pudo exportar diagnostico")
+            messagebox.showerror("Diagnóstico", str(exc))
+
     def _schedule_logs(self) -> None:
         if self._closed or self._logs_after_id is not None or not self._widget_exists(self.master):
             return
@@ -581,15 +644,6 @@ class AdminPanel(ttk.Frame):
             except Exception:
                 LOGGER.exception("Fallo inesperado durante el refresco de logs")
         self._schedule_logs()
-
-    def _uptime_text(self) -> str:
-        started = process_start_time(self.pid)
-        if not started:
-            return NOT_AVAILABLE
-        seconds = int(time.time() - started)
-        hours, remainder = divmod(seconds, 3600)
-        minutes, secs = divmod(remainder, 60)
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
     def _run_background(self, target, title: str) -> None:
         def runner() -> None:
@@ -614,7 +668,9 @@ class AdminPanel(ttk.Frame):
             self.on_reinstall()
 
     def _confirm_exit(self) -> None:
-        if process_exists(self.pid):
+        server_status = get_server_status(self.config)
+        target_pid = server_status.pid or self.pid
+        if process_exists(target_pid):
             answer = messagebox.askyesnocancel(
                 "Salir",
                 "El servidor continuará ejecutándose en segundo plano.\n\n"
@@ -625,10 +681,10 @@ class AdminPanel(ttk.Frame):
             if answer is None:
                 return
             if answer is False:
-                if not is_waitress_process(self.pid, self.project_path):
+                if not is_waitress_process(target_pid, self.project_path):
                     messagebox.showerror("Salir", "El PID almacenado no corresponde al Waitress de Gestion Fiduciaria.")
                     return
-                if not stop_process(self.pid):
+                if not stop_process(target_pid):
                     messagebox.showerror("Salir", "No se pudo detener el proceso Waitress.")
                     return
                 update_config({"pid": None})
@@ -681,6 +737,24 @@ class AdminPanel(ttk.Frame):
             return NOT_AVAILABLE
         text = str(value).strip()
         return text if text and text != "-" else NOT_AVAILABLE
+
+    def _reconciled_config(self) -> dict:
+        config = load_config() or self.config
+        status = get_server_status(config)
+        try:
+            stored_pid = int(config.get("pid")) if config.get("pid") else None
+        except (TypeError, ValueError):
+            stored_pid = None
+        project_path = Path(config.get("project_path", ""))
+        if status.pid and stored_pid != status.pid:
+            LOGGER.warning("PID almacenado corregido de %s a %s", stored_pid, status.pid)
+            return update_config({"pid": status.pid})
+        if stored_pid and not status.pid and not process_exists(stored_pid):
+            LOGGER.warning("PID almacenado %s ya no existe; se limpia configuracion", stored_pid)
+            return update_config({"pid": None})
+        if stored_pid and not status.pid and not is_waitress_process(stored_pid, project_path):
+            LOGGER.error("PID almacenado %s no corresponde a Waitress del proyecto", stored_pid)
+        return config
 
 
 class _UserDialog(Toplevel):

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 
 import psycopg2
+from psycopg2 import OperationalError
 from psycopg2 import sql
 
 
@@ -28,6 +30,14 @@ class AdminDatabaseCredentials:
     database: str = "postgres"
 
 
+@dataclass
+class DatabaseCheckResult:
+    ok: bool
+    status: str
+    message: str
+    elapsed_ms: int | None = None
+
+
 def validate_identifier(identifier: str) -> bool:
     return bool(IDENTIFIER_RE.fullmatch(identifier or ""))
 
@@ -42,6 +52,62 @@ def check_connection(credentials: DatabaseCredentials) -> None:
         connect_timeout=5,
     ):
         return
+
+
+def test_connection(credentials: DatabaseCredentials) -> DatabaseCheckResult:
+    started = time.perf_counter()
+    try:
+        check_connection(credentials)
+    except OperationalError as exc:
+        elapsed = int((time.perf_counter() - started) * 1000)
+        message = str(exc).lower()
+        if "password authentication failed" in message or "authentication failed" in message:
+            return DatabaseCheckResult(False, "credenciales_invalidas", "Credenciales incorrectas.", elapsed)
+        if "does not exist" in message and "database" in message:
+            return DatabaseCheckResult(False, "base_inexistente", "La base de datos no existe.", elapsed)
+        if "timeout expired" in message or "timed out" in message or "timeout" in message:
+            return DatabaseCheckResult(False, "timeout", "La conexion supero el tiempo de espera.", elapsed)
+        if "connection refused" in message or "could not connect" in message or "no connection could be made" in message:
+            return DatabaseCheckResult(False, "servidor_apagado", "PostgreSQL no responde en el host/puerto configurado.", elapsed)
+        return DatabaseCheckResult(False, "error_operacional", "No se pudo conectar a PostgreSQL.", elapsed)
+    except Exception:
+        elapsed = int((time.perf_counter() - started) * 1000)
+        if _looks_like_decoding_error():
+            return _classify_decoding_failure(credentials, elapsed)
+        return DatabaseCheckResult(False, "error_inesperado", "Error inesperado al probar la conexion.", elapsed)
+    elapsed = int((time.perf_counter() - started) * 1000)
+    return DatabaseCheckResult(True, "ok", "Conexion correcta.", elapsed)
+
+
+def _looks_like_decoding_error() -> bool:
+    import sys
+
+    exc = sys.exc_info()[1]
+    return isinstance(exc, UnicodeDecodeError)
+
+
+def _classify_decoding_failure(credentials: DatabaseCredentials, elapsed_ms: int) -> DatabaseCheckResult:
+    try:
+        with psycopg2.connect(
+            host=credentials.host,
+            port=credentials.port,
+            dbname="postgres",
+            user=credentials.user,
+            password=credentials.password,
+            connect_timeout=5,
+        ):
+            return DatabaseCheckResult(False, "base_inexistente", "La base de datos no existe.", elapsed_ms)
+    except UnicodeDecodeError:
+        return DatabaseCheckResult(False, "credenciales_invalidas", "Credenciales incorrectas.", elapsed_ms)
+    except OperationalError as exc:
+        message = str(exc).lower()
+        if "connection refused" in message or "could not connect" in message or "no connection could be made" in message:
+            return DatabaseCheckResult(False, "servidor_apagado", "PostgreSQL no responde en el host/puerto configurado.", elapsed_ms)
+        if "timeout" in message or "timed out" in message:
+            return DatabaseCheckResult(False, "timeout", "La conexion supero el tiempo de espera.", elapsed_ms)
+        return DatabaseCheckResult(False, "credenciales_invalidas", "Credenciales incorrectas.", elapsed_ms)
+    except Exception:
+        return DatabaseCheckResult(False, "error_inesperado", "Error inesperado al probar la conexion.", elapsed_ms)
 
 
 def ensure_database(admin: AdminDatabaseCredentials, db_name: str, owner: str, owner_password: str) -> list[str]:

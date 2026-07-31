@@ -1,11 +1,17 @@
+import logging
+
 from app.logging_config import configure_logging
 from app.admin_panel import AdminPanel
-from app.config_manager import is_config_complete, load_config
+from app.config_manager import is_config_complete, load_config, try_reconstruct_config
 from app.wizard import InstallWizard
 from tkinter import Tk
 
 
+LOGGER = logging.getLogger(__name__)
+
+
 def launch() -> None:
+    LOGGER.info("Inicio de Gestion Fiduciaria Server Manager")
     root = Tk()
 
     def clear_root() -> None:
@@ -28,12 +34,18 @@ def launch() -> None:
         load_config()
         AdminPanel(root, on_reinstall=lambda: show_wizard(allow_cancel=True))
 
-    if is_config_complete(load_config()):
+    config = load_config()
+    if config is None:
+        config = try_reconstruct_config()
+    if is_config_complete(config):
         show_panel()
     else:
         show_wizard()
 
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        LOGGER.info("Cierre de Gestion Fiduciaria Server Manager")
 
 
 if __name__ == "__main__":
