@@ -6,6 +6,8 @@ import json
 import shutil
 from pathlib import Path
 
+from .subprocess_utils import run_hidden
+
 
 def venv_path(project_path: Path) -> Path:
     return project_path / ".venv"
@@ -42,12 +44,10 @@ def collectstatic(project_path: Path, venv: Path) -> None:
     )
 
 def django_shell(project_path: Path, venv: Path, code: str, input_text: str | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    return run_hidden(
         [str(python_executable(venv)), "manage.py", "shell", "-c", code],
         cwd=project_path,
         input=input_text,
-        text=True,
-        capture_output=True,
         check=True,
     )
 
@@ -85,7 +85,7 @@ print(json.dumps({"url": static_url + relative, "relative": relative}))
 
 
 def _run(command: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    result = subprocess.run(command, cwd=cwd, text=True, capture_output=True)
+    result = run_hidden(command, cwd=cwd)
     if result.returncode != 0:
         output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
         command_text = " ".join(command)

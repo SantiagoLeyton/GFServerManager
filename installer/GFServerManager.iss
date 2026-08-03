@@ -31,16 +31,26 @@ Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Crear un acceso directo en el escritorio"; GroupDescription: "Accesos directos:"; Flags: unchecked
+Name: "startup"; Description: "Iniciar Gestion Fiduciaria automaticamente con Windows"; GroupDescription: "Inicio automatico:"; Flags: checkedonce
 
 [Files]
 Source: "..\dist\GFServerManager\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[Dirs]
+Name: "{commonappdata}\ConstructoraCentenario\GFServerManager"; Permissions: users-modify
+Name: "{commonappdata}\ConstructoraCentenario\GFServerManager\data"; Permissions: users-modify
+Name: "{commonappdata}\ConstructoraCentenario\GFServerManager\logs"; Permissions: users-modify
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Run]
+Filename: "{app}\{#AppExeName}"; Parameters: "--install-startup-task"; Flags: runhidden waituntilterminated; Tasks: startup
 Filename: "{app}\{#AppExeName}"; Description: "Iniciar {#AppName}"; Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+Filename: "{app}\{#AppExeName}"; Parameters: "--remove-startup-task"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveStartupTask"
 
 [InstallDelete]
 Type: filesandordirs; Name: "{app}\_internal"

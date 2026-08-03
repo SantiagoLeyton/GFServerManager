@@ -26,6 +26,7 @@ from .server_manager import (
     wait_for_http,
     wait_for_static_file,
 )
+from .startup_task import install_startup_task, query_startup_task, remove_startup_task
 from .ui_components import Dialogs, apply_app_icon, attach_tooltip, configure_styles, timestamp_text
 from .user_manager import change_password, create_user, list_users, set_user_active
 
@@ -60,6 +61,7 @@ class AdminPanel(ttk.Frame):
         self.logs_text: scrolledtext.ScrolledText | None = None
         self.diagnostics_tree: ttk.Treeview | None = None
         self.diagnostics_report: DiagnosticReport | None = None
+        self.startup_task_status = StringVar(value=NOT_AVAILABLE)
 
         self._refresh_after_id: str | None = None
         self._logs_after_id: str | None = None
@@ -90,6 +92,10 @@ class AdminPanel(ttk.Frame):
     @property
     def host(self) -> str:
         return str(self.config.get("host", "0.0.0.0") or "0.0.0.0")
+
+    @property
+    def wsgi_module(self) -> str:
+        return str(self.config.get("wsgi_module", "config.wsgi:application") or "config.wsgi:application")
 
     @property
     def pid(self) -> int | None:
@@ -386,6 +392,24 @@ class AdminPanel(ttk.Frame):
         )
         attach_tooltip(save_button, "Guarda solo el host y puerto del Server Manager.")
 
+        startup_card = self._card(parent, "Inicio automatico con Windows")
+        startup_card.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+        ttk.Label(startup_card, text="Estado:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Label(startup_card, textvariable=self.startup_task_status).grid(row=1, column=1, sticky="w", pady=4)
+        startup_buttons = ttk.Frame(startup_card)
+        startup_buttons.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        refresh = ttk.Button(startup_buttons, text="Actualizar estado", command=self._refresh_startup_task_status)
+        enable = ttk.Button(startup_buttons, text="Activar", command=self._enable_startup_task)
+        disable = ttk.Button(startup_buttons, text="Desactivar", command=self._disable_startup_task)
+        refresh.pack(side="left", padx=(0, 8))
+        enable.pack(side="left", padx=8)
+        disable.pack(side="left", padx=8)
+        attach_tooltip(refresh, "Consulta la tarea programada de inicio automatico.")
+        attach_tooltip(enable, "Crea la tarea programada de Windows para iniciar Waitress al arrancar.")
+        attach_tooltip(disable, "Elimina la tarea programada de inicio automatico.")
+        startup_card.columnconfigure(1, weight=1)
+        self._refresh_startup_task_status()
+
     def _build_logs(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(0, weight=1)
         parent.columnconfigure(0, weight=1)
@@ -605,7 +629,7 @@ class AdminPanel(ttk.Frame):
             self.config = update_config({"pid": None})
             self._info("Servidor", "No hay un proceso Waitress activo registrado.")
             return
-        if not is_waitress_process(target_pid, self.project_path):
+        if not self._is_managed_waitress(target_pid):
             raise RuntimeError("El PID almacenado existe, pero no corresponde al Waitress de Gestion Fiduciaria.")
         if not stop_process(target_pid):
             raise RuntimeError("No se pudo detener el proceso Waitress dentro del tiempo esperado.")
@@ -620,7 +644,7 @@ class AdminPanel(ttk.Frame):
         server_status = get_server_status(self.config)
         target_pid = server_status.pid or self.pid
         if process_exists(target_pid):
-            if not is_waitress_process(target_pid, self.project_path):
+            if not self._is_managed_waitress(target_pid):
                 raise RuntimeError("El PID almacenado existe, pero no corresponde al Waitress de Gestion Fiduciaria.")
             if not stop_process(target_pid):
                 raise RuntimeError("No se pudo detener el proceso Waitress para reiniciar.")
@@ -710,6 +734,35 @@ class AdminPanel(ttk.Frame):
             Dialogs.success("Configuración", "Host y puerto guardados. Reinicie el servidor para aplicar cambios.")
         except Exception as exc:
             Dialogs.error("Configuración", str(exc))
+
+    def _refresh_startup_task_status(self) -> None:
+        try:
+            status = query_startup_task()
+            self.startup_task_status.set(status.message)
+        except Exception as exc:
+            LOGGER.exception("No se pudo consultar la tarea de inicio automatico")
+            self.startup_task_status.set("No se pudo consultar el inicio automatico.")
+            Dialogs.error("Inicio automatico", str(exc))
+
+    def _enable_startup_task(self) -> None:
+        try:
+            status = install_startup_task()
+            self.startup_task_status.set(status.message)
+            Dialogs.success("Inicio automatico", "Inicio automatico con Windows activado.")
+        except Exception as exc:
+            LOGGER.exception("No se pudo activar el inicio automatico")
+            self.startup_task_status.set("No se pudo activar el inicio automatico.")
+            Dialogs.error("Inicio automatico", str(exc))
+
+    def _disable_startup_task(self) -> None:
+        try:
+            status = remove_startup_task()
+            self.startup_task_status.set(status.message)
+            Dialogs.success("Inicio automatico", "Inicio automatico con Windows desactivado.")
+        except Exception as exc:
+            LOGGER.exception("No se pudo desactivar el inicio automatico")
+            self.startup_task_status.set("No se pudo desactivar el inicio automatico.")
+            Dialogs.error("Inicio automatico", str(exc))
 
     def _open_application(self) -> None:
         webbrowser.open(f"http://127.0.0.1:{self.port}/")
@@ -829,7 +882,7 @@ class AdminPanel(ttk.Frame):
             if answer is None:
                 return
             if answer is False:
-                if not is_waitress_process(target_pid, self.project_path):
+                if not self._is_managed_waitress(target_pid):
                     Dialogs.error("Salir", "El PID almacenado no corresponde al Waitress de Gestion Fiduciaria.")
                     return
                 if not stop_process(target_pid):
@@ -932,9 +985,18 @@ class AdminPanel(ttk.Frame):
         if stored_pid and not status.pid and not process_exists(stored_pid):
             LOGGER.warning("PID almacenado %s ya no existe; se limpia configuracion", stored_pid)
             return update_config({"pid": None})
-        if stored_pid and not status.pid and not is_waitress_process(stored_pid, project_path):
+        if stored_pid and not status.pid and not self._is_managed_waitress(stored_pid):
             LOGGER.error("PID almacenado %s no corresponde a Waitress del proyecto", stored_pid)
         return config
+
+    def _is_managed_waitress(self, pid: int | None) -> bool:
+        return is_waitress_process(
+            pid,
+            self.project_path,
+            port=self.port,
+            wsgi_module=self.wsgi_module,
+            venv_path=self.venv_path,
+        )
 
 
 class _UserDialog(Toplevel):

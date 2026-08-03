@@ -18,7 +18,7 @@ El punto de entrada unico es `main.py`.
 La aplicacion guarda datos modificables fuera del directorio de instalacion:
 
 ```text
-%LOCALAPPDATA%\ConstructoraCentenario\GFServerManager
+%PROGRAMDATA%\ConstructoraCentenario\GFServerManager
 ```
 
 Alli se almacenan:
@@ -27,7 +27,7 @@ Alli se almacenan:
 - `logs\server_manager.log`
 - diagnosticos exportados
 
-Si existen datos antiguos en `data\` o `logs\` dentro del repositorio, se migran de forma segura cuando no exista ya el archivo equivalente en LocalAppData.
+Si existen datos antiguos en `%LOCALAPPDATA%\ConstructoraCentenario\GFServerManager` o en `data\`/`logs\` dentro del repositorio, se migran de forma segura cuando no exista ya el archivo equivalente en ProgramData.
 
 ## Compilacion
 
@@ -73,7 +73,7 @@ Para actualizar una instalacion existente:
 2. Ejecute el nuevo instalador.
 3. Instale sobre la misma ruta.
 
-El instalador no elimina la configuracion ni los logs del usuario ubicados en `%LOCALAPPDATA%`.
+El instalador no elimina la configuracion ni los logs ubicados en `%PROGRAMDATA%\ConstructoraCentenario\GFServerManager`.
 
 ## Notas de empaquetado
 

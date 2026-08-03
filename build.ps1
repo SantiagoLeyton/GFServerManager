@@ -74,7 +74,7 @@ if (-not $SkipSmokeTest) {
 }
 
 Write-Step "Comprobando datos persistentes y ausencia de secretos empaquetados"
-$DataRoot = Join-Path $env:LOCALAPPDATA "ConstructoraCentenario\GFServerManager"
+$DataRoot = Join-Path $env:PROGRAMDATA "ConstructoraCentenario\GFServerManager"
 New-Item -ItemType Directory -Force -Path (Join-Path $DataRoot "data") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $DataRoot "logs") | Out-Null
 if (Test-Path ".\dist\GFServerManager\data\server_manager.json") {

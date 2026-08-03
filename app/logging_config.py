@@ -24,11 +24,17 @@ def source_root() -> Path:
 
 
 def app_data_dir() -> Path:
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+    program_data = os.environ.get("PROGRAMDATA")
+    base = Path(program_data) if program_data else Path(os.environ.get("ALLUSERSPROFILE", r"C:\ProgramData"))
     path = base / COMPANY_NAME.replace(" ", "") / TECHNICAL_NAME
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def legacy_app_data_dir() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+    return base / COMPANY_NAME.replace(" ", "") / TECHNICAL_NAME
 
 
 def data_dir() -> Path:
@@ -43,29 +49,33 @@ def logs_dir() -> Path:
     return path
 
 
-def migrate_legacy_data(logger: logging.Logger | None = None) -> None:
+def migrate_legacy_data() -> list[str]:
     global _MIGRATED
     if _MIGRATED:
-        return
+        return []
     _MIGRATED = True
-    legacy_root = source_root()
+    messages: list[str] = []
+    local_root = legacy_app_data_dir()
+    repo_root = source_root()
     migrations = [
-        (legacy_root / "data" / "server_manager.json", data_dir() / "server_manager.json"),
-        (legacy_root / "logs" / "server_manager.log", logs_dir() / "server_manager.log"),
+        (local_root / "data" / "server_manager.json", data_dir() / "server_manager.json"),
+        (local_root / "logs" / "server_manager.log", logs_dir() / "server_manager.log"),
+        (repo_root / "data" / "server_manager.json", data_dir() / "server_manager.json"),
+        (repo_root / "logs" / "server_manager.log", logs_dir() / "server_manager.log"),
     ]
     for source, target in migrations:
         try:
             if source.exists() and not target.exists():
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
-                if logger:
-                    logger.info("Archivo persistente migrado desde %s hacia %s", source, target)
-        except OSError:
-            if logger:
-                logger.exception("No se pudo migrar archivo persistente desde %s", source)
+                messages.append(f"Archivo persistente migrado desde {source} hacia {target}")
+        except OSError as exc:
+            messages.append(f"No se pudo migrar archivo persistente desde {source}: {exc}")
+    return messages
 
 
 def configure_logging() -> None:
+    migration_messages = migrate_legacy_data()
     log_path = logs_dir() / "server_manager.log"
 
     formatter = logging.Formatter("%(levelname)s %(asctime)s %(name)s %(message)s")
@@ -76,4 +86,5 @@ def configure_logging() -> None:
     root_logger.setLevel(logging.INFO)
     root_logger.handlers.clear()
     root_logger.addHandler(handler)
-    migrate_legacy_data(root_logger)
+    for message in migration_messages:
+        root_logger.info(message)

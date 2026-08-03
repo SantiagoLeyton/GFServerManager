@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +14,7 @@ from .logging_config import logs_dir
 from .metadata import APP_VERSION
 from .project_validator import validate_project
 from .server_manager import SERVER_RUNNING, SERVER_STOPPED, get_server_status
+from .subprocess_utils import run_hidden
 
 
 LOGGER = logging.getLogger(__name__)
@@ -134,7 +134,7 @@ def _check_python(items: list[DiagnosticItem], venv_path: Path) -> None:
         items.append(_item("Python", "error", "Python del entorno virtual no disponible."))
         return
     try:
-        result = subprocess.run([str(python), "--version"], capture_output=True, text=True, timeout=10)
+        result = run_hidden([str(python), "--version"], timeout=10)
         version = (result.stdout or result.stderr).strip()
         items.append(_item("Python", "ok" if result.returncode == 0 else "error", version or "Sin salida de version."))
     except Exception:
@@ -148,10 +148,8 @@ def _check_waitress(items: list[DiagnosticItem], venv_path: Path) -> None:
         items.append(_item("Waitress", "error", "No se puede comprobar sin entorno virtual."))
         return
     try:
-        result = subprocess.run(
+        result = run_hidden(
             [str(python), "-c", "import waitress; print(getattr(waitress, '__version__', 'Waitress disponible'))"],
-            capture_output=True,
-            text=True,
             timeout=10,
         )
         output = (result.stdout or result.stderr).strip()

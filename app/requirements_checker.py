@@ -5,6 +5,8 @@ import subprocess
 import sys
 from dataclasses import dataclass
 
+from .subprocess_utils import run_hidden
+
 
 @dataclass
 class RequirementStatus:
@@ -29,10 +31,8 @@ def check_requirements() -> RequirementStatus:
 
     if python:
         try:
-            result = subprocess.run(
+            result = run_hidden(
                 [python, "-m", "venv", "--help"],
-                capture_output=True,
-                text=True,
                 timeout=10,
             )
             if result.returncode != 0:
