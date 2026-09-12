@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import socket
 import subprocess
 import time
@@ -11,13 +12,17 @@ from pathlib import Path
 
 import psutil
 
-from .django_manager import python_executable
+from .django_manager import require_project_python, venv_path as project_venv_path
+from .logging_config import logs_dir
 from .subprocess_utils import popen_hidden
 
 
 SERVER_RUNNING = "Servidor en ejecución"
 SERVER_STOPPED = "Servidor detenido"
 SERVER_UNKNOWN = "Estado desconocido"
+SERVER_APP_ERROR = "Aplicación con error"
+WAITRESS_LOG_NAME = "waitress.log"
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -32,6 +37,18 @@ class ServerStatus:
     port_message: str
     process_message: str
     conflict_message: str | None = None
+    app_responding: bool = False
+    app_ok: bool = False
+    http_status_code: int | None = None
+    http_message: str = "Aplicación no comprobada."
+
+
+@dataclass(frozen=True)
+class HttpHealth:
+    responding: bool
+    ok: bool
+    status_code: int | None
+    message: str
 
 
 DEFAULT_WSGI_MODULE = "config.wsgi:application"
@@ -48,11 +65,10 @@ def is_port_available(port: int, host: str = "0.0.0.0") -> bool:
 
 
 def find_process_on_port(port: int) -> str | None:
-    for proc in psutil.process_iter(["pid", "name"]):
+    for pid in _listener_pids_on_port(port):
         try:
-            for conn in proc.net_connections(kind="inet"):
-                if conn.status == psutil.CONN_LISTEN and conn.laddr and conn.laddr.port == port:
-                    return f"{proc.info['name']} (PID {proc.info['pid']})"
+            proc = psutil.Process(pid)
+            return f"{proc.name()} (PID {pid})"
         except (psutil.Error, PermissionError):
             continue
     return None
@@ -76,11 +92,7 @@ def find_waitress_listener_pid(
     if expected_pid and _trusted_stored_pid_matches_listener(expected_pid, port):
         return expected_pid
 
-    for proc in psutil.process_iter(["pid", "name"]):
-        try:
-            pid = int(proc.info["pid"])
-        except (psutil.Error, PermissionError):
-            continue
+    for pid in _listener_pids_on_port(port):
         if process_matches_waitress(pid, port, project_path, wsgi_module=wsgi_module, venv_path=venv_path):
             return pid
     return None
@@ -178,8 +190,7 @@ def get_server_status(config: dict | None) -> ServerStatus:
 
     project_value = config.get("project_path")
     project_path = Path(str(project_value)) if project_value else Path()
-    venv_value = config.get("venv_path")
-    venv_path = Path(str(venv_value)) if venv_value else None
+    venv_path = project_venv_path(project_path) if project_value else None
     wsgi_module = str(config.get("wsgi_module") or DEFAULT_WSGI_MODULE)
     stored_pid = _safe_int(config.get("pid"))
     listener_pid = (
@@ -194,6 +205,13 @@ def get_server_status(config: dict | None) -> ServerStatus:
         else None
     )
     if listener_pid:
+        health = check_http_health(port, timeout_seconds=1)
+        if health.ok:
+            state = SERVER_RUNNING
+        elif health.responding:
+            state = SERVER_APP_ERROR
+        else:
+            state = SERVER_UNKNOWN
         return ServerStatus(
             running=True,
             pid=listener_pid,
@@ -201,9 +219,13 @@ def get_server_status(config: dict | None) -> ServerStatus:
             port=port,
             listening=True,
             uptime=_format_uptime(listener_pid),
-            state=SERVER_RUNNING,
-            port_message=f"Puerto {port} escuchando.",
+            state=state,
+            port_message=f"Puerto {port} escuchando. {health.message}",
             process_message=f"Waitress activo con PID {listener_pid}.",
+            app_responding=health.responding,
+            app_ok=health.ok,
+            http_status_code=health.status_code,
+            http_message=health.message,
         )
 
     conflict = (
@@ -313,6 +335,23 @@ def _process_listens_on_port(proc: psutil.Process, port: int) -> bool:
     return False
 
 
+def _listener_pids_on_port(port: int) -> list[int]:
+    pids: list[int] = []
+    seen: set[int] = set()
+    try:
+        connections = psutil.net_connections(kind="inet")
+    except (psutil.Error, PermissionError):
+        return pids
+    for conn in connections:
+        pid = getattr(conn, "pid", None)
+        if not pid or pid in seen:
+            continue
+        if conn.status == psutil.CONN_LISTEN and conn.laddr and conn.laddr.port == port:
+            seen.add(pid)
+            pids.append(int(pid))
+    return pids
+
+
 def _normalized_command(proc: psutil.Process) -> str:
     try:
         return _normalize_text(" ".join(proc.cmdline()))
@@ -381,14 +420,20 @@ def _trusted_stored_pid_matches_listener(pid: int, port: int) -> bool:
         proc = psutil.Process(pid)
     except psutil.Error:
         return False
-    return _commandline_access_denied(proc) and _process_listens_on_port(proc, port) and wait_for_http(port, 2)
+    return _commandline_access_denied(proc) and _process_listens_on_port(proc, port) and check_http_health(port, 2).responding
 
 
-def start_waitress(project_path: Path, venv: Path, port: int, host: str = "0.0.0.0") -> subprocess.Popen:
-    own_pid = find_waitress_listener_pid(port, project_path)
+def start_waitress(
+    project_path: Path,
+    venv: Path,
+    port: int,
+    host: str = "0.0.0.0",
+    wsgi_module: str = DEFAULT_WSGI_MODULE,
+) -> subprocess.Popen:
+    own_pid = find_waitress_listener_pid(port, project_path, wsgi_module=wsgi_module, venv_path=project_venv_path(project_path))
     if own_pid:
         raise RuntimeError(f"Waitress ya esta ejecutandose para este proyecto con PID {own_pid}.")
-    conflict = port_conflict_message(port, project_path)
+    conflict = port_conflict_message_for_config(port, project_path, wsgi_module=wsgi_module, venv_path=project_venv_path(project_path))
     if conflict:
         raise RuntimeError(conflict)
     if not is_port_available(port):
@@ -397,29 +442,73 @@ def start_waitress(project_path: Path, venv: Path, port: int, host: str = "0.0.0
         raise RuntimeError(f"El puerto {port} esta ocupado.{detail}")
 
     command = [
-        str(python_executable(venv)),
+        str(require_project_python(project_path)),
         "-m",
         "waitress",
         f"--host={host}",
         f"--port={port}",
-        "config.wsgi:application",
+        wsgi_module,
     ]
-    return popen_hidden(command, cwd=project_path, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log_file = _open_waitress_log()
+    try:
+        process = popen_hidden(command, cwd=project_path, stdout=log_file, stderr=subprocess.STDOUT, log=True)
+        setattr(process, "_gf_waitress_log_file", log_file)
+        return process
+    except Exception:
+        log_file.close()
+        raise
 
 
 def wait_for_http(port: int, timeout_seconds: int = 30) -> bool:
+    return check_http_health(port, timeout_seconds).ok
+
+
+def check_http_health(port: int, timeout_seconds: int = 30) -> HttpHealth:
     deadline = time.time() + timeout_seconds
     url = f"http://127.0.0.1:{port}/"
+    last_message = "La aplicación no respondió en el tiempo esperado."
     while time.time() < deadline:
         try:
             with urllib.request.urlopen(url, timeout=3) as response:
-                return 200 <= response.status < 500
+                status_code = int(response.status)
+                if status_code < 500:
+                    return HttpHealth(True, True, status_code, f"HTTP {status_code}.")
+                return HttpHealth(True, False, status_code, f"HTTP {status_code}: la aplicación respondió con error.")
         except urllib.error.HTTPError as exc:
-            if 300 <= exc.code < 500:
-                return True
+            if exc.code < 500:
+                return HttpHealth(True, True, int(exc.code), f"HTTP {exc.code}.")
+            return HttpHealth(True, False, int(exc.code), f"HTTP {exc.code}: la aplicación respondió con error.")
         except (OSError, urllib.error.URLError):
             time.sleep(1)
-    return False
+    return HttpHealth(False, False, None, last_message)
+
+
+def wait_for_port_release(port: int, timeout_seconds: int = 10) -> bool:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if is_port_available(port):
+            return True
+        time.sleep(0.5)
+    return is_port_available(port)
+
+
+def waitress_log_path() -> Path:
+    return logs_dir() / WAITRESS_LOG_NAME
+
+
+def tail_waitress_log(max_chars: int = 3000) -> str:
+    path = waitress_log_path()
+    try:
+        if not path.exists():
+            return ""
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - max_chars))
+            return handle.read().decode("utf-8", errors="replace").strip()
+    except OSError:
+        LOGGER.debug("No se pudo leer el log de Waitress", exc_info=True)
+        return ""
 
 
 def wait_for_static_file(port: int, static_url: str, timeout_seconds: int = 30) -> bool:
@@ -433,3 +522,33 @@ def wait_for_static_file(port: int, static_url: str, timeout_seconds: int = 30) 
         except (OSError, urllib.error.URLError, urllib.error.HTTPError):
             time.sleep(1)
     return False
+
+
+def _open_waitress_log():
+    path = waitress_log_path()
+    _rotate_waitress_log(path)
+    try:
+        with path.open("ab") as handle:
+            handle.write(f"\n--- Inicio Waitress {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode("utf-8"))
+    except OSError:
+        LOGGER.warning("No se pudo escribir encabezado de log Waitress en %s", path, exc_info=True)
+    return path.open("ab", buffering=0)
+
+
+def _rotate_waitress_log(path: Path, max_bytes: int = 1_000_000, backup_count: int = 3) -> None:
+    try:
+        if not path.exists() or path.stat().st_size <= max_bytes:
+            return
+        for index in range(backup_count - 1, 0, -1):
+            source = Path(f"{path}.{index}")
+            target = Path(f"{path}.{index + 1}")
+            if source.exists():
+                if target.exists():
+                    target.unlink()
+                source.rename(target)
+        first_backup = Path(f"{path}.1")
+        if first_backup.exists():
+            first_backup.unlink()
+        path.rename(first_backup)
+    except OSError:
+        LOGGER.warning("No se pudo rotar el log de Waitress %s", path, exc_info=True)

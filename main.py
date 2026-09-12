@@ -8,10 +8,11 @@ from app.logging_config import configure_logging, data_dir, logs_dir, source_roo
 from app.admin_panel import AdminPanel
 from app.config_manager import CONFIG_PATH, is_config_complete, load_config, try_reconstruct_config
 from app.metadata import PRODUCT_NAME
-from app.server_manager import get_server_status, start_waitress, wait_for_http
+from app.server_manager import check_http_health, get_server_status, start_waitress
 from app.startup_task import install_startup_task, remove_startup_task
 from app.ui_components import apply_app_icon, configure_styles
 from app.wizard import InstallWizard
+from app.django_manager import venv_path as project_venv_path
 from tkinter import Tk
 
 
@@ -116,12 +117,17 @@ def run_startup_mode() -> int:
 
     try:
         project_path = Path(str(config["project_path"]))
-        venv_path = Path(str(config["venv_path"]))
+        venv_path = project_venv_path(project_path)
         port = int(config["port"])
         host = str(config.get("host") or "0.0.0.0")
-        process = start_waitress(project_path, venv_path, port, host=host)
-        if not wait_for_http(port, timeout_seconds=30):
+        LOGGER.info("Automatizacion de backups delegada al scheduler interno de Gestion Fiduciaria.")
+        process = start_waitress(project_path, venv_path, port, host=host, wsgi_module=str(config.get("wsgi_module") or "config.wsgi:application"))
+        health = check_http_health(port, timeout_seconds=30)
+        if not health.responding:
             LOGGER.error("Waitress inicio en modo automatico, pero la aplicacion no respondio pid=%s port=%s", process.pid, port)
+            return 4
+        if not health.ok:
+            LOGGER.error("Waitress responde en modo automatico, pero la aplicacion fallo: %s", health.message)
             return 4
         status = get_server_status(config)
         pid = status.pid or process.pid
@@ -139,7 +145,17 @@ def install_startup_task_mode() -> int:
     LOGGER.info("Instalacion de tarea de inicio automatico solicitada")
     _log_startup_context()
     try:
-        install_startup_task()
+        config = load_config()
+        if not is_config_complete(config):
+            LOGGER.error("No se pudo instalar autoarranque: instalacion incompleta o server_manager.json no disponible")
+            return 2
+        install_startup_task(
+            Path(str(config["project_path"])),
+            project_venv_path(Path(str(config["project_path"]))),
+            host=str(config.get("host") or "0.0.0.0"),
+            port=int(config["port"]),
+            wsgi_module=str(config.get("wsgi_module") or "config.wsgi:application"),
+        )
         return 0
     except Exception:
         LOGGER.exception("No se pudo instalar la tarea de inicio automatico")

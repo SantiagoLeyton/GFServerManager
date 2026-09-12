@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .django_manager import project_python_executable, venv_path as project_venv_path
 from .logging_config import data_dir, source_root
 
 
@@ -82,7 +83,7 @@ def validate_config(config: dict[str, Any] | None) -> list[str]:
         return ["No existe data/server_manager.json."]
     if config is None:
         return ["La configuracion local no se pudo leer o esta corrupta."]
-    required = ["project_path", "venv_path", "wsgi_module", "host", "port", "installation_status"]
+    required = ["project_path", "wsgi_module", "host", "port", "installation_status"]
     for key in required:
         if not config.get(key):
             errors.append(f"Falta {key}.")
@@ -93,11 +94,12 @@ def validate_config(config: dict[str, Any] | None) -> list[str]:
     except (TypeError, ValueError):
         errors.append("El puerto configurado no es numerico.")
     project_path = Path(str(config.get("project_path", "")))
-    venv_path = Path(str(config.get("venv_path", "")))
     if config.get("project_path") and not project_path.exists():
         errors.append("La ruta del proyecto no existe.")
-    if config.get("venv_path") and not venv_path.exists():
-        errors.append("La ruta del entorno virtual no existe.")
+    if config.get("project_path"):
+        expected_venv = project_venv_path(project_path)
+        if not expected_venv.exists():
+            errors.append("La ruta del entorno virtual no existe.")
     return errors
 
 
@@ -107,13 +109,13 @@ def is_config_complete(config: dict[str, Any] | None) -> bool:
     if config.get("installation_status") != "installed":
         return False
     project_path = Path(config["project_path"])
-    venv_path = Path(config["venv_path"])
+    venv_path = project_venv_path(project_path)
     return (
         project_path.exists()
         and (project_path / "manage.py").exists()
         and (project_path / ".env").exists()
         and venv_path.exists()
-        and (venv_path / "Scripts" / "python.exe").exists()
+        and project_python_executable(project_path).exists()
     )
 
 

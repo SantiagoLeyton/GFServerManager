@@ -38,6 +38,23 @@ ENV_KEYS = [
     "DB_CONNECT_TIMEOUT",
     "SESSION_COOKIE_SECURE",
     "CSRF_COOKIE_SECURE",
+    "BACKUP_STORAGE_PATH",
+    "BACKUP_PG_DUMP_PATH",
+    "BACKUP_PG_RESTORE_PATH",
+    "EMAIL_BACKEND",
+    "EMAIL_HOST",
+    "EMAIL_PORT",
+    "EMAIL_HOST_USER",
+    "EMAIL_HOST_PASSWORD",
+    "EMAIL_USE_TLS",
+    "EMAIL_USE_SSL",
+    "DEFAULT_FROM_EMAIL",
+    "SERVER_EMAIL",
+    "GOOGLE_DRIVE_BACKUP_ENABLED",
+    "GOOGLE_DRIVE_TOKEN_FILE",
+    "GOOGLE_DRIVE_BACKUP_FOLDER_ID",
+    "GOOGLE_DRIVE_BACKUP_FOLDER_NAME",
+    "GOOGLE_DRIVE_TIMEOUT_SECONDS",
 ]
 
 
@@ -106,4 +123,3 @@ def _read(path: Path) -> str:
     if not path.exists():
         return ""
     return path.read_text(encoding="utf-8", errors="replace")
-

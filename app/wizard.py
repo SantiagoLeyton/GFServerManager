@@ -8,6 +8,7 @@ from tkinter import BooleanVar, IntVar, StringVar, Tk, filedialog
 from tkinter import scrolledtext
 from tkinter import ttk
 
+from .backup_task import install_backup_task
 from .config_manager import build_config, save_config
 from .database_manager import (
     AdminDatabaseCredentials,
@@ -15,12 +16,29 @@ from .database_manager import (
     ensure_database,
     require_connection,
 )
+from .deployment_config import (
+    DeploymentConfigError,
+    backup_env_values,
+    default_backup_storage_path,
+    detect_postgres_tools,
+    gmail_env_values,
+    prepare_backup_directory,
+    validate_backup_directory,
+    validate_gmail_settings,
+)
 from .django_manager import collectstatic, ensure_virtualenv, find_static_probe_url, install_dependencies, migrate
-from .environment_manager import build_env_values, write_env
+from .environment_manager import build_env_values, read_env, update_env, write_env
+from .google_drive_config import (
+    configure_google_drive,
+    google_drive_disabled_env_values,
+    google_drive_status_from_env,
+    validate_credentials_file,
+)
 from .metadata import PRODUCT_NAME
 from .project_validator import validate_project
 from .requirements_checker import check_requirements
-from .server_manager import find_waitress_listener_pid, start_waitress, wait_for_http, wait_for_static_file
+from .server_manager import check_http_health, find_waitress_listener_pid, start_waitress, wait_for_static_file
+from .startup_task import install_startup_task
 from .ui_components import Dialogs, apply_app_icon, attach_tooltip, configure_styles
 from .user_manager import InitialUser, create_or_update_initial_users
 
@@ -52,13 +70,14 @@ class InstallWizard(ttk.Frame):
         self.owner_user = StringVar(value="pagos_fiducia_owner")
         self.owner_password = StringVar()
         self.port = IntVar(value=8000)
+        self.backup_storage_path = StringVar(value=str(default_backup_storage_path()))
+        self.gmail_email = StringVar()
+        self.gmail_password = StringVar()
+        self.google_drive_credentials_path = StringVar()
+        self.configure_google_drive_later = BooleanVar(value=True)
         self.accounting_email = StringVar(value="contabilidad@correo.com")
         self.accounting_password = StringVar()
         self.accounting_password_confirm = StringVar()
-        self.commercial_email = StringVar(value="comercial@correo.com")
-        self.commercial_password = StringVar()
-        self.commercial_password_confirm = StringVar()
-        self.update_existing_passwords = BooleanVar(value=False)
         self.operation_message = StringVar(value="Listo para instalar")
         self.operation_progress: ttk.Progressbar | None = None
 
@@ -83,16 +102,16 @@ class InstallWizard(ttk.Frame):
 
         self.project_tab = ttk.Frame(notebook, padding=12)
         self.database_tab = ttk.Frame(notebook, padding=12)
-        self.users_tab = ttk.Frame(notebook, padding=12)
+        self.deployment_tab = ttk.Frame(notebook, padding=12)
         self.run_tab = ttk.Frame(notebook, padding=12)
         notebook.add(self.project_tab, text="Proyecto")
         notebook.add(self.database_tab, text="Base de datos")
-        notebook.add(self.users_tab, text="Usuarios")
+        notebook.add(self.deployment_tab, text="Configuracion")
         notebook.add(self.run_tab, text="Instalar")
 
         self._build_project_tab()
         self._build_database_tab()
-        self._build_users_tab()
+        self._build_deployment_tab()
         self._build_run_tab()
 
     def _build_project_tab(self) -> None:
@@ -148,26 +167,83 @@ class InstallWizard(ttk.Frame):
         )
         attach_tooltip(test_button, "Verifica que los datos permiten conectar con PostgreSQL.")
 
-    def _build_users_tab(self) -> None:
-        self.users_tab.columnconfigure(1, weight=1)
+    def _build_deployment_tab(self) -> None:
+        self.deployment_tab.columnconfigure(1, weight=1)
+        existing_env = self._safe_read_current_env()
+        if existing_env.get("EMAIL_HOST_USER"):
+            self.gmail_email.set(existing_env["EMAIL_HOST_USER"])
+        ttk.Label(self.deployment_tab, text="Copias de seguridad", style="Section.TLabel").grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 8)
+        )
+        ttk.Label(self.deployment_tab, text="Carpeta de backups").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(self.deployment_tab, textvariable=self.backup_storage_path).grid(
+            row=1, column=1, sticky="ew", pady=4
+        )
+        browse_backup = ttk.Button(self.deployment_tab, text="Seleccionar", command=self._browse_backup_storage)
+        browse_backup.grid(row=1, column=2, padx=(8, 0), pady=4)
+        attach_tooltip(browse_backup, "Seleccione la carpeta donde se almacenaran las copias de seguridad.")
+
+        detect_button = ttk.Button(
+            self.deployment_tab,
+            text="Detectar PostgreSQL",
+            command=self._detect_postgres_clicked,
+        )
+        detect_button.grid(row=2, column=0, sticky="w", pady=(6, 14))
+        attach_tooltip(detect_button, "Comprueba que pg_dump y pg_restore estan disponibles.")
+
+        ttk.Label(self.deployment_tab, text="Correo", style="Section.TLabel").grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(8, 8)
+        )
+        ttk.Label(self.deployment_tab, text="Correo remitente Gmail").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Entry(self.deployment_tab, textvariable=self.gmail_email).grid(row=4, column=1, sticky="ew", pady=4)
+        ttk.Label(self.deployment_tab, text="Contrasena de aplicacion de Gmail").grid(
+            row=5, column=0, sticky="w", pady=4
+        )
+        ttk.Entry(self.deployment_tab, textvariable=self.gmail_password, show="*").grid(
+            row=5, column=1, sticky="ew", pady=4
+        )
+
+        ttk.Label(self.deployment_tab, text="Google Drive", style="Section.TLabel").grid(
+            row=6, column=0, columnspan=3, sticky="w", pady=(18, 8)
+        )
+        ttk.Label(self.deployment_tab, text="Cuenta autorizada").grid(row=7, column=0, sticky="w", pady=4)
+        ttk.Label(self.deployment_tab, text="Se definira durante OAuth").grid(row=7, column=1, sticky="w", pady=4)
+        ttk.Label(self.deployment_tab, text="Credenciales OAuth").grid(row=8, column=0, sticky="w", pady=4)
+        ttk.Entry(self.deployment_tab, textvariable=self.google_drive_credentials_path).grid(
+            row=8, column=1, sticky="ew", pady=4
+        )
+        browse_drive = ttk.Button(self.deployment_tab, text="Seleccionar", command=self._browse_google_drive_credentials)
+        browse_drive.grid(row=8, column=2, padx=(8, 0), pady=4)
+        attach_tooltip(browse_drive, "Seleccione el credentials.json OAuth de tipo Desktop App.")
+        ttk.Checkbutton(
+            self.deployment_tab,
+            text="Configurar Google Drive despues",
+            variable=self.configure_google_drive_later,
+        ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ttk.Label(
+            self.deployment_tab,
+            text="Al autorizar, use la cuenta Google definida por la empresa para backups.",
+            style="Muted.TLabel",
+        ).grid(row=10, column=0, columnspan=3, sticky="w", pady=(4, 8))
+
+        ttk.Label(self.deployment_tab, text="Acceso inicial", style="Section.TLabel").grid(
+            row=11, column=0, columnspan=3, sticky="w", pady=(18, 8)
+        )
+        ttk.Label(
+            self.deployment_tab,
+            text="Cuenta tecnica minima para el primer ingreso de Contabilidad.",
+            style="Muted.TLabel",
+        ).grid(row=12, column=0, columnspan=3, sticky="w", pady=(0, 8))
         rows = [
             ("Correo Contabilidad", self.accounting_email, False),
             ("Contrasena Contabilidad", self.accounting_password, True),
             ("Confirmar Contabilidad", self.accounting_password_confirm, True),
-            ("Correo Comercial", self.commercial_email, False),
-            ("Contrasena Comercial", self.commercial_password, True),
-            ("Confirmar Comercial", self.commercial_password_confirm, True),
         ]
-        for index, (label, variable, secret) in enumerate(rows):
-            ttk.Label(self.users_tab, text=label).grid(row=index, column=0, sticky="w", pady=4)
-            ttk.Entry(self.users_tab, textvariable=variable, show="*" if secret else "").grid(
+        for index, (label, variable, secret) in enumerate(rows, start=13):
+            ttk.Label(self.deployment_tab, text=label).grid(row=index, column=0, sticky="w", pady=4)
+            ttk.Entry(self.deployment_tab, textvariable=variable, show="*" if secret else "").grid(
                 row=index, column=1, sticky="ew", pady=4
             )
-        ttk.Checkbutton(
-            self.users_tab,
-            text="Actualizar contrasenas si los usuarios ya existen",
-            variable=self.update_existing_passwords,
-        ).grid(row=len(rows), column=0, columnspan=2, sticky="w", pady=(10, 0))
 
     def _build_run_tab(self) -> None:
         self.run_tab.columnconfigure(0, weight=1)
@@ -205,6 +281,40 @@ class InstallWizard(ttk.Frame):
         selected = filedialog.askdirectory(title="Seleccionar carpeta de Gestion Fiduciaria")
         if selected:
             self.project_path.set(selected)
+
+    def _browse_backup_storage(self) -> None:
+        selected = filedialog.askdirectory(title="Seleccione la carpeta donde se almacenaran las copias de seguridad")
+        if selected:
+            self.backup_storage_path.set(selected)
+
+    def _browse_google_drive_credentials(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Seleccionar credentials.json de Google Drive",
+            filetypes=[("JSON", "*.json"), ("Todos los archivos", "*.*")],
+        )
+        if selected:
+            try:
+                validate_credentials_file(selected)
+                self.google_drive_credentials_path.set(selected)
+                self.configure_google_drive_later.set(False)
+            except Exception as exc:
+                Dialogs.error("Google Drive", str(exc))
+
+    def _detect_postgres_clicked(self) -> None:
+        try:
+            tools = detect_postgres_tools(Path(self.project_path.get().strip()))
+            Dialogs.success(
+                "PostgreSQL",
+                f"pg_dump detectado:\n{tools.pg_dump}\n\npg_restore detectado:\n{tools.pg_restore}",
+            )
+        except DeploymentConfigError as exc:
+            Dialogs.error("PostgreSQL", str(exc))
+
+    def _safe_read_current_env(self) -> dict[str, str]:
+        try:
+            return read_env(Path(self.project_path.get().strip()))
+        except Exception:
+            return {}
 
     def _run_requirement_check(self) -> None:
         status = check_requirements()
@@ -286,9 +396,32 @@ class InstallWizard(ttk.Frame):
 
             self._log("Generando .env sin registrar secretos...")
             env_values = build_env_values(credentials, port)
-            env_result = write_env(project_path, env_values, backup_existing=bool(snapshot["backup_existing"]))
+            current_env = read_env(project_path)
+            self._log("Validando carpeta de copias de seguridad...")
+            backup_path = prepare_backup_directory(str(snapshot["backup_storage_path"]))
+            self._log("Detectando herramientas PostgreSQL para backups...")
+            postgres_tools = detect_postgres_tools(project_path)
+            env_values.update(backup_env_values(backup_path, postgres_tools))
+            gmail_email = str(snapshot["gmail_email"]) or current_env.get("EMAIL_HOST_USER", "")
+            gmail_password = str(snapshot["gmail_password"]) or current_env.get("EMAIL_HOST_PASSWORD", "")
+            env_values.update(gmail_env_values(gmail_email, gmail_password))
+            if not current_env.get("GOOGLE_DRIVE_BACKUP_ENABLED") and not str(snapshot["google_drive_credentials_path"]):
+                env_values.update(google_drive_disabled_env_values())
+            validate_gmail_settings(env_values)
+            env_result = (
+                update_env(project_path, env_values, backup_existing=True)
+                if Path(project_path / ".env").exists()
+                else write_env(project_path, env_values, backup_existing=bool(snapshot["backup_existing"]))
+            )
             if env_result.backup_path:
                 self._log(f"Respaldo creado: {env_result.backup_path.name}")
+
+            if str(snapshot["google_drive_credentials_path"]):
+                self._log("Autorizando Google Drive. Use la cuenta Google definida por la empresa en el navegador...")
+                configure_google_drive(project_path, str(snapshot["google_drive_credentials_path"]))
+                self._log("Google Drive configurado correctamente.")
+            elif not google_drive_status_from_env(project_path).configured:
+                self._log("Google Drive queda pendiente de configuracion; backups locales activos.")
 
             self._log("Preparando entorno virtual...")
             venv = ensure_virtualenv(project_path)
@@ -296,15 +429,19 @@ class InstallWizard(ttk.Frame):
             install_dependencies(project_path, venv)
             self._log("Ejecutando migraciones...")
             migrate(project_path, venv)
+            self._log("Configurando tarea automatica de comprobacion de backups...")
+            install_backup_task(project_path, venv)
+            self._log("Configurando autoarranque del servidor con Windows...")
+            install_startup_task(project_path, venv, port=port)
             self._log("Recolectando archivos estaticos...")
             collectstatic(project_path, venv)
             static_probe_url = find_static_probe_url(project_path, venv)
-            self._log("Creando o actualizando usuarios iniciales...")
+            self._log("Verificando cuenta inicial tecnica de Contabilidad...")
             user_output = create_or_update_initial_users(
                 project_path,
                 venv,
                 self._initial_users(snapshot),
-                update_existing=bool(snapshot["update_existing_passwords"]),
+                update_existing=False,
             )
             if user_output:
                 self._log(user_output)
@@ -316,8 +453,11 @@ class InstallWizard(ttk.Frame):
                 self._log("Iniciando Waitress...")
                 process = start_waitress(project_path, venv, port)
             self._log("Verificando respuesta HTTP local...")
-            if not wait_for_http(port):
+            health = check_http_health(port)
+            if not health.responding:
                 raise RuntimeError("Waitress inicio, pero la aplicacion no respondio en el tiempo esperado.")
+            if not health.ok:
+                raise RuntimeError(f"Waitress responde, pero la aplicacion devolvio {health.message}")
             self._log("Verificando archivo estatico real...")
             if not wait_for_static_file(port, static_probe_url):
                 raise RuntimeError("La aplicacion respondio, pero no se pudo servir un archivo estatico real.")
@@ -345,18 +485,20 @@ class InstallWizard(ttk.Frame):
             raise ValueError("Seleccione la carpeta de Gestion Fiduciaria.")
         if int(self.port.get()) < 1024 or int(self.port.get()) > 65535:
             raise ValueError("El puerto debe estar entre 1024 y 65535.")
-        for label, value in [
-            ("Correo Contabilidad", self.accounting_email.get()),
-            ("Correo Comercial", self.commercial_email.get()),
-        ]:
-            if "@" not in value:
-                raise ValueError(f"{label} no parece un correo valido.")
+        if "@" not in self.accounting_email.get():
+            raise ValueError("Correo Contabilidad no parece un correo valido.")
         if self.accounting_password.get() != self.accounting_password_confirm.get():
             raise ValueError("Las contrasenas de Contabilidad no coinciden.")
-        if self.commercial_password.get() != self.commercial_password_confirm.get():
-            raise ValueError("Las contrasenas de Comercial no coinciden.")
-        if not self.accounting_password.get() or not self.commercial_password.get():
-            raise ValueError("Digite las contrasenas iniciales.")
+        if not self.accounting_password.get():
+            raise ValueError("Digite la contrasena inicial de Contabilidad.")
+        validate_backup_directory(self.backup_storage_path.get())
+        detect_postgres_tools(Path(self.project_path.get().strip()))
+        current_env = read_env(Path(self.project_path.get().strip()))
+        gmail_email = self.gmail_email.get().strip() or current_env.get("EMAIL_HOST_USER", "")
+        gmail_password = self.gmail_password.get() or current_env.get("EMAIL_HOST_PASSWORD", "")
+        validate_gmail_settings(gmail_env_values(gmail_email, gmail_password))
+        if self.google_drive_credentials_path.get().strip():
+            validate_credentials_file(self.google_drive_credentials_path.get().strip())
         self._validate_database_inputs()
 
     def _validate_database_inputs(self) -> None:
@@ -463,11 +605,12 @@ class InstallWizard(ttk.Frame):
             "owner_user": self.owner_user.get().strip(),
             "owner_password": self.owner_password.get(),
             "port": int(self.port.get()),
+            "backup_storage_path": self.backup_storage_path.get().strip(),
+            "gmail_email": self.gmail_email.get().strip(),
+            "gmail_password": self.gmail_password.get(),
+            "google_drive_credentials_path": self.google_drive_credentials_path.get().strip(),
             "accounting_email": self.accounting_email.get().strip().lower(),
             "accounting_password": self.accounting_password.get(),
-            "commercial_email": self.commercial_email.get().strip().lower(),
-            "commercial_password": self.commercial_password.get(),
-            "update_existing_passwords": self.update_existing_passwords.get(),
         }
 
     def _initial_users(self, snapshot: dict[str, object]) -> list[InitialUser]:
@@ -478,13 +621,6 @@ class InstallWizard(ttk.Frame):
                 email=str(snapshot["accounting_email"]),
                 password=str(snapshot["accounting_password"]),
                 role="accounting_admin",
-            ),
-            InitialUser(
-                label="Comercial",
-                username=_username_from_email(str(snapshot["commercial_email"])),
-                email=str(snapshot["commercial_email"]),
-                password=str(snapshot["commercial_password"]),
-                role="commercial",
             ),
         ]
 

@@ -5,30 +5,49 @@ import os
 import threading
 import webbrowser
 from pathlib import Path
-from tkinter import IntVar, StringVar, Tk, Toplevel, messagebox
+from tkinter import Canvas, IntVar, StringVar, Tk, filedialog, messagebox
 from tkinter import scrolledtext
 from tkinter import ttk
 
+from .backup_task import install_backup_task, query_backup_task, run_backup_check_now
 from .config_manager import detect_hostname, detect_local_ipv4, load_config, update_config
 from .database_manager import test_connection
+from .deployment_config import (
+    backup_env_values,
+    default_backup_storage_path,
+    detect_postgres_tools,
+    gmail_env_values,
+    prepare_backup_directory,
+    test_gmail_smtp,
+    validate_gmail_settings,
+)
 from .diagnostics import DiagnosticReport, export_diagnostics, level_icon, run_diagnostics
-from .django_manager import find_static_probe_url
-from .environment_manager import env_database_credentials, is_env_valid, read_env
+from .django_manager import find_static_probe_url, project_python_executable, venv_path as project_venv_path
+from .environment_manager import env_database_credentials, is_env_valid, read_env, update_env
+from .google_drive_config import (
+    configure_google_drive,
+    configure_google_drive_later,
+    google_drive_status_from_env,
+    test_google_drive_connection,
+    validate_credentials_file,
+)
 from .logging_config import logs_dir
-from .metadata import APP_AUTHOR, APP_DESCRIPTION, APP_LICENSE, APP_TECHNOLOGIES, APP_VERSION, APP_YEAR, PRODUCT_NAME
+from .metadata import APP_AUTHOR, APP_DESCRIPTION, APP_LICENSE, APP_TECHNOLOGIES, APP_YEAR, PRODUCT_NAME
 from .project_validator import validate_project
 from .server_manager import (
+    check_http_health,
     get_server_status,
     is_waitress_process,
     process_exists,
     start_waitress,
     stop_process,
-    wait_for_http,
+    tail_waitress_log,
+    wait_for_port_release,
     wait_for_static_file,
+    waitress_log_path,
 )
 from .startup_task import install_startup_task, query_startup_task, remove_startup_task
-from .ui_components import Dialogs, apply_app_icon, attach_tooltip, configure_styles, timestamp_text
-from .user_manager import change_password, create_user, list_users, set_user_active
+from .ui_components import COLORS, Dialogs, apply_app_icon, attach_tooltip, configure_styles, timestamp_text
 
 
 LOGGER = logging.getLogger(__name__)
@@ -57,14 +76,25 @@ class AdminPanel(ttk.Frame):
         self.status_updated = StringVar(value="Ultima actualizacion: No disponible")
         self.operation_progress: ttk.Progressbar | None = None
         self._diagnostics_signature: tuple[object, ...] | None = None
-        self.users_tree: ttk.Treeview | None = None
         self.logs_text: scrolledtext.ScrolledText | None = None
         self.diagnostics_tree: ttk.Treeview | None = None
         self.diagnostics_report: DiagnosticReport | None = None
         self.startup_task_status = StringVar(value=NOT_AVAILABLE)
+        self.backup_task_status = StringVar(value=NOT_AVAILABLE)
+        self.google_drive_status = StringVar(value=NOT_AVAILABLE)
+        self.google_drive_account = StringVar(value=NOT_AVAILABLE)
+        self.google_drive_credentials_path = StringVar()
+        self.smtp_test_recipient = StringVar()
 
         self._refresh_after_id: str | None = None
         self._logs_after_id: str | None = None
+        self._status_refresh_running = False
+        self._status_refresh_pending = False
+        self._last_statuses: dict[str, bool] | None = None
+        self._last_server_status = None
+        self._backup_task_status_running = False
+        self._startup_task_status_running = False
+        self._diagnostics_running = False
         self._closed = False
 
         self._build()
@@ -79,7 +109,7 @@ class AdminPanel(ttk.Frame):
 
     @property
     def venv_path(self) -> Path:
-        return Path(self.config.get("venv_path", ""))
+        return project_venv_path(self.project_path)
 
     @property
     def port(self) -> int:
@@ -128,11 +158,9 @@ class AdminPanel(ttk.Frame):
         sidebar.grid_propagate(False)
 
         ttk.Label(sidebar, text="Gestion Fiduciaria", style="SidebarTitle.TLabel").pack(anchor="w")
-        ttk.Label(sidebar, text=f"Server Manager v{APP_VERSION}", style="SidebarSubtle.TLabel").pack(
-            anchor="w", pady=(2, 22)
-        )
+        ttk.Label(sidebar, text="Server Manager", style="SidebarSubtle.TLabel").pack(anchor="w", pady=(2, 22))
 
-        main_sections = ["Inicio", "Servidor", "Base de datos", "Usuarios", "Configuración"]
+        main_sections = ["Inicio", "Servidor", "Base de datos", "Configuración"]
         support_sections = ["Logs", "Diagnóstico", "Acerca de"]
         self._build_nav_group(sidebar, main_sections)
         ttk.Separator(sidebar).pack(fill="x", pady=14)
@@ -168,7 +196,6 @@ class AdminPanel(ttk.Frame):
         bar = ttk.Frame(self, style="StatusBar.TFrame", padding=(14, 6))
         bar.grid(row=1, column=0, columnspan=2, sticky="ew")
         values = [
-            ("version", StringVar(value=f"v{APP_VERSION}")),
             ("general", self.status_general),
             ("server", self.status_server),
             ("updated", self.status_updated),
@@ -179,8 +206,8 @@ class AdminPanel(ttk.Frame):
             label.grid(row=0, column=column, sticky="w", padx=(0, 18))
             self.status_bar_labels[key] = label
         self.operation_progress = ttk.Progressbar(bar, mode="indeterminate", length=120)
-        self.operation_progress.grid(row=0, column=5, sticky="e")
-        bar.columnconfigure(4, weight=1)
+        self.operation_progress.grid(row=0, column=len(values), sticky="e")
+        bar.columnconfigure(len(values) - 1, weight=1)
 
     def _nav_hover(self, widget: ttk.Label, section: str, hovering: bool) -> None:
         if section == self.current_section:
@@ -214,13 +241,20 @@ class AdminPanel(ttk.Frame):
             "Inicio": self._build_home,
             "Servidor": self._build_server,
             "Base de datos": self._build_database,
-            "Usuarios": self._build_users,
             "Configuración": self._build_configuration,
             "Logs": self._build_logs,
             "Diagnóstico": self._build_diagnostics,
             "Acerca de": self._build_about,
         }
-        builders[name](container)
+        if name == "Configuración":
+            scrollable, canvas = self._build_scrollable_container(container)
+            builders[name](scrollable)
+            self._bind_mousewheel_to_scrollable(scrollable, canvas)
+            self._refresh_scrollable_region(scrollable, canvas)
+            canvas.after_idle(lambda: self._reset_scrollable_view(scrollable, canvas))
+        else:
+            builders[name](container)
+        self._apply_cached_status()
         self._refresh_status()
 
     def _clear_dynamic_references(self) -> None:
@@ -230,9 +264,78 @@ class AdminPanel(ttk.Frame):
         self.server_cards.clear()
         self.db_labels.clear()
         self.config_vars.clear()
-        self.users_tree = None
         self.logs_text = None
         self.diagnostics_tree = None
+
+    def _build_scrollable_container(self, parent: ttk.Frame) -> tuple[ttk.Frame, Canvas]:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+
+        canvas = Canvas(parent, borderwidth=0, highlightthickness=0, background=COLORS["bg"])
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas, style="Content.TFrame")
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        inner.columnconfigure(0, weight=1)
+
+        def sync_scroll_region(_event=None) -> None:
+            if self._widget_exists(canvas):
+                canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def sync_inner_width(event) -> None:
+            if self._widget_exists(canvas):
+                canvas.itemconfigure(window_id, width=event.width)
+                sync_scroll_region()
+
+        inner.bind("<Configure>", sync_scroll_region, add="+")
+        canvas.bind("<Configure>", sync_inner_width, add="+")
+        return inner, canvas
+
+    def _bind_mousewheel_to_scrollable(self, root_widget, canvas: Canvas) -> None:
+        def on_mousewheel(event) -> str:
+            if self._widget_exists(canvas):
+                steps = -1 * int(event.delta / 120) if event.delta else 0
+                if steps:
+                    canvas.yview_scroll(steps, "units")
+            return "break"
+
+        for widget in self._iter_widget_tree(root_widget):
+            try:
+                widget.bind("<MouseWheel>", on_mousewheel, add="+")
+            except Exception:
+                LOGGER.debug("No se pudo enlazar rueda del mouse en widget desplazable", exc_info=True)
+        try:
+            canvas.bind("<MouseWheel>", on_mousewheel, add="+")
+        except Exception:
+            LOGGER.debug("No se pudo enlazar rueda del mouse en canvas desplazable", exc_info=True)
+
+    def _iter_widget_tree(self, root_widget):
+        yield root_widget
+        try:
+            children = root_widget.winfo_children()
+        except Exception:
+            children = []
+        for child in children:
+            yield from self._iter_widget_tree(child)
+
+    def _refresh_scrollable_region(self, scrollable_frame, canvas: Canvas) -> None:
+        try:
+            scrollable_frame.update_idletasks()
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        except Exception:
+            LOGGER.debug("No se pudo actualizar region desplazable", exc_info=True)
+
+    def _reset_scrollable_view(self, scrollable_frame, canvas: Canvas) -> None:
+        if not self._widget_exists(canvas):
+            return
+        self._refresh_scrollable_region(scrollable_frame, canvas)
+        try:
+            canvas.yview_moveto(0)
+        except Exception:
+            LOGGER.debug("No se pudo reiniciar posicion de scroll", exc_info=True)
 
     def _build_home(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -335,41 +438,8 @@ class AdminPanel(ttk.Frame):
         )
         attach_tooltip(test_button, "Comprueba la conexion con PostgreSQL usando el archivo .env.")
 
-    def _build_users(self, parent: ttk.Frame) -> None:
-        parent.rowconfigure(0, weight=1)
-        parent.columnconfigure(0, weight=1)
-
-        columns = ("name", "email", "active", "groups")
-        tree = ttk.Treeview(parent, columns=columns, show="headings", selectmode="browse")
-        self.users_tree = tree
-        for key, text, width in [
-            ("name", "Nombre", 220),
-            ("email", "Correo", 260),
-            ("active", "Activo", 80),
-            ("groups", "Grupos", 240),
-        ]:
-            tree.heading(key, text=text)
-            tree.column(key, width=width, anchor="w")
-        tree.grid(row=0, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        tree.configure(yscrollcommand=scrollbar.set)
-
-        buttons = ttk.Frame(parent)
-        buttons.grid(row=1, column=0, sticky="w", pady=(12, 0))
-        user_buttons = [
-            ("Actualizar", self._load_users, "Recarga la lista de usuarios desde Django."),
-            ("Crear usuario", self._open_create_user_dialog, "Crea un usuario usando el modelo real de Django."),
-            ("Cambiar contraseña", self._open_password_dialog, "Actualiza la contraseña del usuario seleccionado."),
-            ("Activar/desactivar", self._toggle_user_active, "Cambia el estado activo del usuario seleccionado."),
-        ]
-        for index, (text, command, tooltip) in enumerate(user_buttons):
-            button = ttk.Button(buttons, text=text, command=command)
-            button.pack(side="left", padx=(0, 8) if index == 0 else 8)
-            attach_tooltip(button, tooltip)
-        self._load_users()
-
     def _build_configuration(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
         card = self._card(parent, "Configuración local")
         card.grid(row=0, column=0, sticky="nsew")
         values = [
@@ -392,8 +462,122 @@ class AdminPanel(ttk.Frame):
         )
         attach_tooltip(save_button, "Guarda solo el host y puerto del Server Manager.")
 
+        env_values = self._safe_read_env()
+        backup_card = self._card(parent, "Copias de seguridad")
+        backup_card.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+        backup_path = StringVar(value=env_values.get("BACKUP_STORAGE_PATH") or str(default_backup_storage_path()))
+        self.config_vars["BACKUP_STORAGE_PATH"] = backup_path
+        ttk.Label(backup_card, text="Ruta:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(backup_card, textvariable=backup_path, width=80).grid(row=1, column=1, sticky="ew", pady=4)
+        browse = ttk.Button(backup_card, text="Seleccionar", command=self._browse_backup_folder)
+        browse.grid(row=1, column=2, sticky="w", padx=(8, 0), pady=4)
+        ttk.Label(backup_card, text="pg_dump:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Label(backup_card, text=env_values.get("BACKUP_PG_DUMP_PATH", NOT_AVAILABLE), wraplength=620).grid(
+            row=2, column=1, columnspan=2, sticky="w", pady=4
+        )
+        ttk.Label(backup_card, text="pg_restore:").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Label(backup_card, text=env_values.get("BACKUP_PG_RESTORE_PATH", NOT_AVAILABLE), wraplength=620).grid(
+            row=3, column=1, columnspan=2, sticky="w", pady=4
+        )
+        save_backups = ttk.Button(backup_card, text="Guardar backups", command=self._save_backup_configuration)
+        save_backups.grid(row=4, column=0, sticky="w", pady=(12, 0))
+        attach_tooltip(browse, "Seleccione la carpeta fisica para almacenar los ZIP de backup.")
+        attach_tooltip(save_backups, "Valida carpeta, detecta PostgreSQL y actualiza .env.")
+        backup_card.columnconfigure(1, weight=1)
+
+        task_card = self._card(parent, "Automatizacion de backups")
+        task_card.grid(row=2, column=0, sticky="ew", pady=(14, 0))
+        ttk.Label(task_card, text="Estado:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Label(task_card, textvariable=self.backup_task_status, wraplength=640).grid(
+            row=1, column=1, sticky="w", pady=4
+        )
+        task_buttons = ttk.Frame(task_card)
+        task_buttons.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        refresh_backup_task = ttk.Button(task_buttons, text="Actualizar estado", command=self._refresh_backup_task_status)
+        enable_backup_task = ttk.Button(task_buttons, text="Activar/Reparar", command=self._enable_backup_task)
+        run_backup_check = ttk.Button(task_buttons, text="Ejecutar comprobacion de backup", command=self._run_backup_check)
+        refresh_backup_task.pack(side="left", padx=(0, 8))
+        enable_backup_task.pack(side="left", padx=8)
+        run_backup_check.pack(side="left", padx=8)
+        attach_tooltip(refresh_backup_task, "Consulta la tarea programada de comprobacion de backups.")
+        attach_tooltip(enable_backup_task, "Crea o repara la tarea programada de backups.")
+        attach_tooltip(run_backup_check, "Ejecuta run_daily_backup_check respetando las reglas normales de PagosFiducia.")
+        task_card.columnconfigure(1, weight=1)
+        self._refresh_backup_task_status_async()
+
+        drive_card = self._card(parent, "Google Drive")
+        drive_card.grid(row=3, column=0, sticky="ew", pady=(14, 0))
+        drive_status = google_drive_status_from_env(self.project_path)
+        self.google_drive_status.set(drive_status.message)
+        self.google_drive_account.set(drive_status.account_email or "No disponible")
+        ttk.Label(drive_card, text="Cuenta Google autorizada:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Label(drive_card, textvariable=self.google_drive_account).grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Label(drive_card, text="Credenciales OAuth:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Label(drive_card, text="Configuradas" if drive_status.credentials_present else "No configuradas").grid(
+            row=2, column=1, sticky="w", pady=4
+        )
+        ttk.Label(drive_card, text="Autorizacion:").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Label(drive_card, text="Activa" if drive_status.configured else "Pendiente").grid(
+            row=3, column=1, sticky="w", pady=4
+        )
+        ttk.Label(drive_card, text="Carpeta:").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Label(drive_card, text=drive_status.folder_name).grid(row=4, column=1, sticky="w", pady=4)
+        ttk.Label(drive_card, text="Conexion:").grid(row=5, column=0, sticky="w", pady=4)
+        ttk.Label(drive_card, textvariable=self.google_drive_status, wraplength=620).grid(
+            row=5, column=1, sticky="w", pady=4
+        )
+        ttk.Label(drive_card, text="credentials.json:").grid(row=6, column=0, sticky="w", pady=4)
+        ttk.Entry(drive_card, textvariable=self.google_drive_credentials_path, width=72).grid(
+            row=6, column=1, sticky="ew", pady=4
+        )
+        browse_drive = ttk.Button(drive_card, text="Seleccionar", command=self._browse_google_drive_credentials)
+        browse_drive.grid(row=6, column=2, padx=(8, 0), pady=4)
+        drive_buttons = ttk.Frame(drive_card)
+        drive_buttons.grid(row=7, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        authorize_drive = ttk.Button(drive_buttons, text="Autorizar nuevamente", command=self._authorize_google_drive)
+        test_drive = ttk.Button(drive_buttons, text="Probar Google Drive", command=self._test_google_drive)
+        configure_later = ttk.Button(drive_buttons, text="Configurar despues", command=self._configure_google_drive_later)
+        authorize_drive.pack(side="left", padx=(0, 8))
+        test_drive.pack(side="left", padx=8)
+        configure_later.pack(side="left", padx=8)
+        attach_tooltip(browse_drive, "Seleccione credentials.json OAuth de tipo Desktop App.")
+        attach_tooltip(authorize_drive, "Abre OAuth oficial para autorizar la cuenta Google seleccionada.")
+        attach_tooltip(test_drive, "Valida token, Drive API y carpeta remota sin subir backups.")
+        attach_tooltip(configure_later, "Desactiva Drive y mantiene backups locales.")
+        drive_card.columnconfigure(1, weight=1)
+
+        mail_card = self._card(parent, "Correo Gmail")
+        mail_card.grid(row=4, column=0, sticky="ew", pady=(14, 0))
+        gmail_email = StringVar(value=env_values.get("EMAIL_HOST_USER", ""))
+        gmail_password = StringVar()
+        self.config_vars["EMAIL_HOST_USER"] = gmail_email
+        self.config_vars["EMAIL_HOST_PASSWORD"] = gmail_password
+        ttk.Label(mail_card, text="Correo remitente:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(mail_card, textvariable=gmail_email, width=40).grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Label(mail_card, text="Configurada:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Label(mail_card, text="Si" if env_values.get("EMAIL_HOST_PASSWORD") else "No").grid(
+            row=2, column=1, sticky="w", pady=4
+        )
+        ttk.Label(mail_card, text="Contrasena de aplicacion:").grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Entry(mail_card, textvariable=gmail_password, show="*", width=40).grid(
+            row=3, column=1, sticky="ew", pady=4
+        )
+        ttk.Label(mail_card, text="Destinatario prueba:").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Entry(mail_card, textvariable=self.smtp_test_recipient, width=40).grid(
+            row=4, column=1, sticky="ew", pady=4
+        )
+        mail_buttons = ttk.Frame(mail_card)
+        mail_buttons.grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        save_mail = ttk.Button(mail_buttons, text="Guardar correo", command=self._save_gmail_configuration)
+        test_mail = ttk.Button(mail_buttons, text="Probar correo", command=self._test_gmail_configuration)
+        save_mail.pack(side="left", padx=(0, 8))
+        test_mail.pack(side="left", padx=8)
+        attach_tooltip(save_mail, "Guarda la configuracion SMTP de Gmail en .env sin mostrar la credencial.")
+        attach_tooltip(test_mail, "Prueba autenticacion SMTP usando la contrasena ingresada o configurada.")
+        mail_card.columnconfigure(1, weight=1)
+
         startup_card = self._card(parent, "Inicio automatico con Windows")
-        startup_card.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+        startup_card.grid(row=5, column=0, sticky="ew", pady=(14, 0))
         ttk.Label(startup_card, text="Estado:").grid(row=1, column=0, sticky="w", pady=4)
         ttk.Label(startup_card, textvariable=self.startup_task_status).grid(row=1, column=1, sticky="w", pady=4)
         startup_buttons = ttk.Frame(startup_card)
@@ -408,7 +592,7 @@ class AdminPanel(ttk.Frame):
         attach_tooltip(enable, "Crea la tarea programada de Windows para iniciar Waitress al arrancar.")
         attach_tooltip(disable, "Elimina la tarea programada de inicio automatico.")
         startup_card.columnconfigure(1, weight=1)
-        self._refresh_startup_task_status()
+        self._refresh_startup_task_status_async()
 
     def _build_logs(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(0, weight=1)
@@ -453,7 +637,6 @@ class AdminPanel(ttk.Frame):
         card = self._card(parent, PRODUCT_NAME)
         card.grid(row=0, column=0, sticky="ew")
         rows = [
-            ("Version", APP_VERSION),
             ("Descripcion", APP_DESCRIPTION),
             ("Autor", APP_AUTHOR),
             ("Anio", APP_YEAR),
@@ -499,10 +682,42 @@ class AdminPanel(ttk.Frame):
     def _refresh_status(self) -> None:
         if self._closed or not self._widget_exists(self):
             return
-        self.config = self._reconciled_config()
-        server_status = get_server_status(self.config)
-        statuses = self._status_snapshot(server_status)
+        if self._status_refresh_running:
+            self._status_refresh_pending = True
+            return
+        self._status_refresh_running = True
+        config_snapshot = load_config() or self.config
 
+        def worker() -> None:
+            try:
+                server_status = get_server_status(config_snapshot)
+                config = self._reconcile_config_with_status(config_snapshot, server_status)
+                statuses = self._status_snapshot(server_status)
+                self._after_ui(lambda: self._apply_status_result(config, server_status, statuses, None))
+            except Exception as exc:
+                LOGGER.exception("No se pudo refrescar estado del panel")
+                self._after_ui(lambda exc=exc: self._apply_status_result(config_snapshot, None, None, exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_cached_status(self) -> None:
+        if self._last_statuses is not None and self._last_server_status is not None:
+            self._apply_status_to_current_section(self._last_statuses, self._last_server_status)
+
+    def _apply_status_result(self, config, server_status, statuses, error) -> None:
+        self._status_refresh_running = False
+        if self._closed or not self._widget_exists(self):
+            return
+        if error is None and server_status is not None and statuses is not None:
+            self.config = config
+            self._last_server_status = server_status
+            self._last_statuses = statuses
+            self._apply_status_to_current_section(statuses, server_status)
+        if self._status_refresh_pending:
+            self._status_refresh_pending = False
+            self._refresh_status()
+
+    def _apply_status_to_current_section(self, statuses: dict[str, bool], server_status) -> None:
         if self.current_section == "Inicio":
             for label, ok in statuses.items():
                 self._set_indicator_label(self.status_labels.get(label), label, "ok" if ok else "warning")
@@ -514,7 +729,12 @@ class AdminPanel(ttk.Frame):
             self._set_label(self.info_labels.get("Tiempo desde el último inicio"), self._value_or_na(server_status.uptime))
 
         if self.current_section == "Servidor":
-            self._set_server_card("Estado", server_status.state, "Servicio disponible" if server_status.running else "Servicio sin proceso activo")
+            state_detail = (
+                server_status.http_message
+                if server_status.running
+                else "Servicio sin proceso activo"
+            )
+            self._set_server_card("Estado", server_status.state, state_detail)
             self._set_server_card("Puerto", server_status.port_message, f"Host configurado: {server_status.host}")
             self._set_server_card("PID", str(server_status.pid) if server_status.pid else NOT_AVAILABLE, server_status.process_message)
             self._set_server_card("Tiempo de ejecución", self._value_or_na(server_status.uptime), "Se actualiza automaticamente")
@@ -531,9 +751,6 @@ class AdminPanel(ttk.Frame):
                 self.db_labels.get("Estado de conexión"),
                 "Conectada" if statuses["Base de datos conectada"] else "Sin conexión",
             )
-
-        if self.current_section == "Diagnóstico":
-            self._run_diagnostics_clicked(force=False, signature=self._diagnostics_signature_for(server_status))
 
         self._update_status_bar(statuses, server_status)
 
@@ -558,7 +775,7 @@ class AdminPanel(ttk.Frame):
         try:
             server_status = server_status or get_server_status(self.config)
             waitress_ok = server_status.running
-            app_ok = wait_for_http(server_status.port, timeout_seconds=1) if waitress_ok else False
+            app_ok = server_status.app_ok if waitress_ok else False
         except Exception:
             LOGGER.exception("No se pudo comprobar el estado de Waitress")
         return {
@@ -607,10 +824,24 @@ class AdminPanel(ttk.Frame):
             raise RuntimeError(server_status.conflict_message)
         if self.pid and process_exists(self.pid):
             raise RuntimeError("El PID almacenado existe, pero no corresponde al Waitress de Gestion Fiduciaria.")
+        self._validate_server_start_preconditions()
         static_url = find_static_probe_url(self.project_path, self.venv_path)
-        process = start_waitress(self.project_path, self.venv_path, self.port, host=self.host)
-        if not wait_for_http(self.port):
-            raise RuntimeError("Waitress inició, pero la aplicación no respondió.")
+        process = start_waitress(self.project_path, self.venv_path, self.port, host=self.host, wsgi_module=self.wsgi_module)
+        if self._process_exited(process):
+            self.config = update_config({"pid": None})
+            raise RuntimeError(self._startup_failure_message("Waitress finalizo inmediatamente al arrancar."))
+        health = check_http_health(self.port)
+        if self._process_exited(process):
+            self.config = update_config({"pid": None})
+            raise RuntimeError(self._startup_failure_message("Waitress finalizo antes de responder correctamente."))
+        if not health.responding:
+            self.config = update_config({"pid": None})
+            raise RuntimeError(self._startup_failure_message("Waitress inicio, pero la aplicacion no respondio."))
+        if not health.ok:
+            server_status = get_server_status(self.config)
+            pid = server_status.pid or process.pid
+            self.config = update_config({"pid": pid, "ipv4": detect_local_ipv4(), "hostname": detect_hostname()})
+            raise RuntimeError(self._startup_failure_message(f"Waitress responde, pero Django devolvio {health.message}"))
         if not wait_for_static_file(self.port, static_url):
             raise RuntimeError("La aplicación respondió, pero no sirvió archivos estáticos.")
         server_status = get_server_status(self.config)
@@ -633,6 +864,8 @@ class AdminPanel(ttk.Frame):
             raise RuntimeError("El PID almacenado existe, pero no corresponde al Waitress de Gestion Fiduciaria.")
         if not stop_process(target_pid):
             raise RuntimeError("No se pudo detener el proceso Waitress dentro del tiempo esperado.")
+        if not wait_for_port_release(self.port):
+            raise RuntimeError("Waitress se detuvo, pero el puerto no quedo libre dentro del tiempo esperado.")
         self.config = update_config({"pid": None})
         LOGGER.info("Waitress detenido")
         self._info("Servidor", "Servidor detenido correctamente.")
@@ -648,78 +881,43 @@ class AdminPanel(ttk.Frame):
                 raise RuntimeError("El PID almacenado existe, pero no corresponde al Waitress de Gestion Fiduciaria.")
             if not stop_process(target_pid):
                 raise RuntimeError("No se pudo detener el proceso Waitress para reiniciar.")
+            if not wait_for_port_release(self.port):
+                raise RuntimeError("El puerto no quedo libre para reiniciar Waitress.")
             self.config = update_config({"pid": None})
         LOGGER.info("Reiniciando Waitress")
         self._start_server_worker()
 
-    def _load_users(self) -> None:
-        if not self._widget_exists(self.users_tree):
-            return
+    def _validate_server_start_preconditions(self) -> None:
+        inspection = validate_project(self.project_path)
+        if not inspection.valid:
+            raise RuntimeError("Proyecto de Gestion Fiduciaria invalido: " + "; ".join(inspection.errors))
+        python = project_python_executable(self.project_path)
+        if not python.exists():
+            raise RuntimeError(f"No existe python.exe del entorno virtual: {python}")
+        if not (self.project_path / ".env").exists():
+            raise RuntimeError("No existe el archivo .env de Gestion Fiduciaria.")
+        if not is_env_valid(self.project_path):
+            raise RuntimeError("El archivo .env no contiene la configuracion minima requerida.")
+        if not self.wsgi_module or ":" not in self.wsgi_module:
+            raise RuntimeError("El modulo WSGI configurado no es valido.")
+        if not self._database_ok(silent=True):
+            raise RuntimeError("PostgreSQL no esta disponible con la configuracion actual.")
+
+    def _process_exited(self, process) -> bool:
+        poll = getattr(process, "poll", None)
+        if not callable(poll):
+            return False
         try:
-            self.users_tree.delete(*self.users_tree.get_children())
-            for user in list_users(self.project_path, self.venv_path):
-                groups = ", ".join(user.get("groups") or [])
-                active = "Sí" if user.get("is_active") else "No"
-                self.users_tree.insert(
-                    "",
-                    "end",
-                    iid=str(user["id"]),
-                    values=(user.get("name", ""), user.get("email", ""), active, groups),
-                    tags=("active" if user.get("is_active") else "inactive",),
-                )
-        except Exception as exc:
-            LOGGER.exception("Fallo la lectura de usuarios")
-            Dialogs.error("Usuarios", str(exc))
+            return poll() is not None
+        except Exception:
+            LOGGER.debug("No se pudo consultar poll() de Waitress", exc_info=True)
+            return False
 
-    def _selected_user_id(self) -> int | None:
-        if not self._widget_exists(self.users_tree):
-            return None
-        selection = self.users_tree.selection()
-        return int(selection[0]) if selection else None
-
-    def _open_create_user_dialog(self) -> None:
-        dialog = _UserDialog(self.master, "Crear usuario")
-        self.master.wait_window(dialog)
-        if not dialog.result:
-            return
-        self._run_background(lambda: self._create_user_worker(dialog.result), "Usuarios")
-
-    def _create_user_worker(self, data: dict[str, str]) -> None:
-        create_user(self.project_path, self.venv_path, data)
-        self._after_ui(self._load_users)
-        self._info("Usuarios", "Usuario creado correctamente.")
-
-    def _open_password_dialog(self) -> None:
-        user_id = self._selected_user_id()
-        if not user_id:
-            Dialogs.warning("Usuarios", "Seleccione un usuario.")
-            return
-        dialog = _PasswordDialog(self.master)
-        self.master.wait_window(dialog)
-        if not dialog.result:
-            return
-        self._run_background(lambda: self._change_password_worker(user_id, dialog.result), "Usuarios")
-
-    def _change_password_worker(self, user_id: int, password: str) -> None:
-        change_password(self.project_path, self.venv_path, user_id, password)
-        self._info("Usuarios", "Contraseña actualizada correctamente.")
-
-    def _toggle_user_active(self) -> None:
-        user_id = self._selected_user_id()
-        if not user_id or not self._widget_exists(self.users_tree):
-            Dialogs.warning("Usuarios", "Seleccione un usuario.")
-            return
-        values = self.users_tree.item(str(user_id), "values")
-        is_active = values[2] == "Sí"
-        action = "desactivar" if is_active else "activar"
-        if not Dialogs.confirm("Usuarios", f"¿Desea {action} este usuario?"):
-            return
-        self._run_background(lambda: self._toggle_user_worker(user_id, not is_active), "Usuarios")
-
-    def _toggle_user_worker(self, user_id: int, active: bool) -> None:
-        set_user_active(self.project_path, self.venv_path, user_id, active)
-        self._after_ui(self._load_users)
-        self._info("Usuarios", "Estado actualizado correctamente.")
+    def _startup_failure_message(self, message: str) -> str:
+        log_tail = tail_waitress_log()
+        if log_tail:
+            return f"{message}\n\nUltimas lineas de log Waitress:\n{log_tail}"
+        return f"{message}\n\nLog Waitress: {waitress_log_path()}"
 
     def _save_host_port(self) -> None:
         try:
@@ -735,7 +933,183 @@ class AdminPanel(ttk.Frame):
         except Exception as exc:
             Dialogs.error("Configuración", str(exc))
 
+    def _browse_backup_folder(self) -> None:
+        selected = filedialog.askdirectory(title="Seleccione la carpeta donde se almacenaran las copias de seguridad")
+        if selected and "BACKUP_STORAGE_PATH" in self.config_vars:
+            self.config_vars["BACKUP_STORAGE_PATH"].set(selected)
+
+    def _save_backup_configuration(self) -> None:
+        try:
+            backup_path = prepare_backup_directory(str(self.config_vars["BACKUP_STORAGE_PATH"].get()))
+            tools = detect_postgres_tools(self.project_path)
+            update_env(self.project_path, backup_env_values(backup_path, tools), backup_existing=True)
+            LOGGER.info("Configuracion de backups actualizada. storage=%s pg_dump=%s pg_restore=%s", backup_path, tools.pg_dump, tools.pg_restore)
+            Dialogs.success("Copias de seguridad", "Configuracion de backups guardada correctamente.")
+            self._show_section("Configuración")
+        except Exception as exc:
+            LOGGER.exception("No se pudo guardar configuracion de backups")
+            Dialogs.error("Copias de seguridad", str(exc))
+
+    def _refresh_backup_task_status(self) -> None:
+        self._refresh_backup_task_status_async(show_errors=True)
+
+    def _refresh_backup_task_status_async(self, show_errors: bool = False) -> None:
+        if self._backup_task_status_running:
+            return
+        self._backup_task_status_running = True
+        self.backup_task_status.set("Consultando automatizacion de backups...")
+
+        def worker() -> None:
+            try:
+                status = query_backup_task()
+                self._after_ui(lambda: self._apply_backup_task_status(status.message))
+            except Exception as exc:
+                LOGGER.exception("No se pudo consultar la tarea de backups")
+                self._after_ui(lambda: self._apply_backup_task_status("No se pudo consultar la automatizacion de backups."))
+                if show_errors:
+                    self._after_ui(lambda exc=exc: Dialogs.error("Automatizacion de backups", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_backup_task_status(self, message: str) -> None:
+        self._backup_task_status_running = False
+        if self._widget_exists(self):
+            self.backup_task_status.set(message)
+
+    def _refresh_backup_task_status_sync(self) -> None:
+        try:
+            status = query_backup_task()
+            self.backup_task_status.set(status.message)
+        except Exception:
+            LOGGER.exception("No se pudo consultar la tarea de backups")
+            self.backup_task_status.set("No se pudo consultar la automatizacion de backups.")
+
+    def _enable_backup_task(self) -> None:
+        try:
+            status = install_backup_task(self.project_path, self.venv_path)
+            self.backup_task_status.set(status.message)
+            Dialogs.success("Automatizacion de backups", "Automatizacion de backups activada.")
+        except Exception as exc:
+            LOGGER.exception("No se pudo activar la automatizacion de backups")
+            self.backup_task_status.set("No se pudo activar la automatizacion de backups.")
+            Dialogs.error("Automatizacion de backups", str(exc))
+
+    def _run_backup_check(self) -> None:
+        self._run_background(self._run_backup_check_worker, "Backups")
+
+    def _run_backup_check_worker(self) -> None:
+        output = run_backup_check_now(self.project_path, self.venv_path)
+        self._info("Backups", output)
+
+    def _browse_google_drive_credentials(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Seleccionar credentials.json de Google Drive",
+            filetypes=[("JSON", "*.json"), ("Todos los archivos", "*.*")],
+        )
+        if not selected:
+            return
+        try:
+            validate_credentials_file(selected)
+            self.google_drive_credentials_path.set(selected)
+            self.google_drive_status.set("Credenciales OAuth validas. Autorice Google Drive para completar.")
+        except Exception as exc:
+            Dialogs.error("Google Drive", str(exc))
+
+    def _authorize_google_drive(self) -> None:
+        credentials_path = self.google_drive_credentials_path.get().strip() or None
+        self._run_background(lambda: self._authorize_google_drive_worker(credentials_path), "Google Drive")
+
+    def _authorize_google_drive_worker(self, credentials_path: str | None) -> None:
+        if credentials_path:
+            validate_credentials_file(credentials_path)
+        result = configure_google_drive(self.project_path, credentials_path)
+        self._after_ui(lambda: self.google_drive_status.set("Google Drive configurado."))
+        if result.account_email:
+            self._after_ui(lambda: self.google_drive_account.set(result.account_email or "No disponible"))
+        email_text = f"\nCuenta detectada: {result.account_email}" if result.account_email else ""
+        self._info(
+            "Google Drive",
+            "Google Drive autorizado correctamente.\n"
+            f"Carpeta: {result.folder_name}{email_text}",
+        )
+
+    def _test_google_drive(self) -> None:
+        self._run_background(self._test_google_drive_worker, "Google Drive")
+
+    def _test_google_drive_worker(self) -> None:
+        status = test_google_drive_connection(self.project_path)
+        self._after_ui(lambda: self.google_drive_status.set(status.message))
+        if status.account_email:
+            self._after_ui(lambda: self.google_drive_account.set(status.account_email or "No disponible"))
+        email_text = f"\nCuenta detectada: {status.account_email}" if status.account_email else ""
+        self._info("Google Drive", f"{status.message}\nCarpeta: {status.folder_name}{email_text}")
+
+    def _configure_google_drive_later(self) -> None:
+        try:
+            configure_google_drive_later(self.project_path)
+            self.google_drive_status.set("Google Drive pendiente de configuracion; backups locales activos.")
+            Dialogs.success("Google Drive", "Google Drive quedo desactivado. Los backups locales siguen activos.")
+            self._show_section("Configuración")
+        except Exception as exc:
+            LOGGER.exception("No se pudo desactivar Google Drive")
+            Dialogs.error("Google Drive", str(exc))
+
+    def _save_gmail_configuration(self) -> None:
+        try:
+            env_values = self._safe_read_env()
+            email = str(self.config_vars["EMAIL_HOST_USER"].get()).strip()
+            password = str(self.config_vars["EMAIL_HOST_PASSWORD"].get())
+            if not password:
+                password = env_values.get("EMAIL_HOST_PASSWORD", "")
+            updates = gmail_env_values(email, password)
+            validate_gmail_settings({**env_values, **updates})
+            update_env(self.project_path, updates, backup_existing=True)
+            LOGGER.info("Configuracion SMTP Gmail actualizada.")
+            Dialogs.success("Correo Gmail", "Configuracion de correo guardada correctamente.")
+            self._show_section("Configuración")
+        except Exception as exc:
+            LOGGER.exception("No se pudo guardar configuracion SMTP Gmail")
+            Dialogs.error("Correo Gmail", str(exc))
+
+    def _test_gmail_configuration(self) -> None:
+        env_values = self._safe_read_env()
+        typed_password = str(self.config_vars["EMAIL_HOST_PASSWORD"].get())
+        email = str(self.config_vars["EMAIL_HOST_USER"].get()).strip() or env_values.get("EMAIL_HOST_USER", "")
+        recipient = self.smtp_test_recipient.get().strip() or email
+        values = {**env_values, **gmail_env_values(email, typed_password or env_values.get("EMAIL_HOST_PASSWORD"))}
+        self._run_background(lambda: self._test_gmail_configuration_worker(values, recipient), "Correo Gmail")
+
+    def _test_gmail_configuration_worker(self, values: dict[str, str], recipient: str) -> None:
+        test_gmail_smtp(values, recipient=recipient)
+        self._info("Correo Gmail", "Correo enviado correctamente.")
+
     def _refresh_startup_task_status(self) -> None:
+        self._refresh_startup_task_status_async(show_errors=True)
+
+    def _refresh_startup_task_status_async(self, show_errors: bool = False) -> None:
+        if self._startup_task_status_running:
+            return
+        self._startup_task_status_running = True
+        self.startup_task_status.set("Consultando inicio automatico...")
+
+        def worker() -> None:
+            try:
+                status = query_startup_task()
+                self._after_ui(lambda: self._apply_startup_task_status(status.message))
+            except Exception as exc:
+                LOGGER.exception("No se pudo consultar la tarea de inicio automatico")
+                self._after_ui(lambda: self._apply_startup_task_status("No se pudo consultar el inicio automatico."))
+                if show_errors:
+                    self._after_ui(lambda exc=exc: Dialogs.error("Inicio automatico", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_startup_task_status(self, message: str) -> None:
+        self._startup_task_status_running = False
+        if self._widget_exists(self):
+            self.startup_task_status.set(message)
+
+    def _refresh_startup_task_status_sync(self) -> None:
         try:
             status = query_startup_task()
             self.startup_task_status.set(status.message)
@@ -746,7 +1120,13 @@ class AdminPanel(ttk.Frame):
 
     def _enable_startup_task(self) -> None:
         try:
-            status = install_startup_task()
+            status = install_startup_task(
+                self.project_path,
+                self.venv_path,
+                host=self.host,
+                port=self.port,
+                wsgi_module=self.wsgi_module,
+            )
             self.startup_task_status.set(status.message)
             Dialogs.success("Inicio automatico", "Inicio automatico con Windows activado.")
         except Exception as exc:
@@ -790,15 +1170,40 @@ class AdminPanel(ttk.Frame):
         self.logs_text.see("end")
 
     def _run_diagnostics_clicked(self, force: bool = True, signature: tuple[object, ...] | None = None) -> None:
-        signature = signature or self._diagnostics_signature_for(get_server_status(load_config()))
+        if self._diagnostics_running:
+            return
+        signature = signature or (
+            self._diagnostics_signature_for(self._last_server_status)
+            if self._last_server_status is not None
+            else ("pending", self.config.get("project_path"), str(self.venv_path))
+        )
         if not force and signature == self._diagnostics_signature:
             return
         self._set_busy(True, "Ejecutando diagnostico...")
-        self.diagnostics_report = run_diagnostics(load_config())
-        self._diagnostics_signature = signature
+        self._diagnostics_running = True
+        config_snapshot = load_config()
+
+        def worker() -> None:
+            try:
+                report = run_diagnostics(config_snapshot)
+                self._after_ui(lambda: self._apply_diagnostics_report(report, signature, None))
+            except Exception as exc:
+                LOGGER.exception("No se pudo ejecutar diagnostico")
+                self._after_ui(lambda exc=exc: self._apply_diagnostics_report(None, signature, exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_diagnostics_report(self, report: DiagnosticReport | None, signature: tuple[object, ...], error) -> None:
+        self._diagnostics_running = False
         if not self._widget_exists(self.diagnostics_tree):
             self._set_busy(False, "Listo")
             return
+        if error is not None or report is None:
+            self._set_busy(False, "No se pudo ejecutar diagnostico")
+            Dialogs.error("Diagnostico", "No se pudo ejecutar el diagnostico.")
+            return
+        self.diagnostics_report = report
+        self._diagnostics_signature = signature
         self.diagnostics_tree.delete(*self.diagnostics_tree.get_children())
         for item in self.diagnostics_report.items:
             self.diagnostics_tree.insert("", "end", values=(level_icon(item.level), item.name, item.message))
@@ -812,7 +1217,7 @@ class AdminPanel(ttk.Frame):
             server_status.port,
             server_status.listening,
             self.config.get("project_path"),
-            self.config.get("venv_path"),
+            str(self.venv_path),
             self.config.get("installation_status"),
         )
 
@@ -887,6 +1292,9 @@ class AdminPanel(ttk.Frame):
                     return
                 if not stop_process(target_pid):
                     Dialogs.error("Salir", "No se pudo detener el proceso Waitress.")
+                    return
+                if not wait_for_port_release(self.port):
+                    Dialogs.error("Salir", "Waitress se detuvo, pero el puerto no quedo libre.")
                     return
                 update_config({"pid": None})
         self._dispose()
@@ -973,7 +1381,9 @@ class AdminPanel(ttk.Frame):
 
     def _reconciled_config(self) -> dict:
         config = load_config() or self.config
-        status = get_server_status(config)
+        return self._reconcile_config_with_status(config, get_server_status(config))
+
+    def _reconcile_config_with_status(self, config: dict, status) -> dict:
         try:
             stored_pid = int(config.get("pid")) if config.get("pid") else None
         except (TypeError, ValueError):
@@ -997,95 +1407,3 @@ class AdminPanel(ttk.Frame):
             wsgi_module=self.wsgi_module,
             venv_path=self.venv_path,
         )
-
-
-class _UserDialog(Toplevel):
-    def __init__(self, master: Tk, title: str) -> None:
-        super().__init__(master)
-        self.title(title)
-        self.resizable(False, False)
-        self.result: dict[str, str] | None = None
-        self.vars = {
-            "first_name": StringVar(),
-            "last_name": StringVar(),
-            "username": StringVar(),
-            "email": StringVar(),
-            "password": StringVar(),
-            "password2": StringVar(),
-        }
-        self.role = StringVar(value="commercial")
-
-        body = ttk.Frame(self, padding=14)
-        body.grid(sticky="nsew")
-        fields = [
-            ("Nombres", "first_name", False),
-            ("Apellidos", "last_name", False),
-            ("Usuario", "username", False),
-            ("Correo", "email", False),
-            ("Contraseña", "password", True),
-            ("Confirmar contraseña", "password2", True),
-        ]
-        for index, (label, key, secret) in enumerate(fields):
-            ttk.Label(body, text=label).grid(row=index, column=0, sticky="w", pady=4)
-            ttk.Entry(body, textvariable=self.vars[key], show="*" if secret else "", width=34).grid(
-                row=index, column=1, pady=4
-            )
-        ttk.Label(body, text="Rol").grid(row=6, column=0, sticky="w", pady=4)
-        ttk.Combobox(
-            body,
-            textvariable=self.role,
-            values=("commercial", "accounting_admin"),
-            state="readonly",
-            width=31,
-        ).grid(row=6, column=1, pady=4)
-        buttons = ttk.Frame(body)
-        buttons.grid(row=7, column=0, columnspan=2, sticky="e", pady=(12, 0))
-        ttk.Button(buttons, text="Cancelar", command=self.destroy).pack(side="right", padx=(8, 0))
-        ttk.Button(buttons, text="Crear", command=self._accept).pack(side="right")
-        self.grab_set()
-
-    def _accept(self) -> None:
-        data = {key: var.get().strip() for key, var in self.vars.items()}
-        if not data["username"] or not data["email"] or not data["password"]:
-            Dialogs.error("Usuarios", "Usuario, correo y contraseña son obligatorios.")
-            return
-        if data["password"] != data.pop("password2"):
-            Dialogs.error("Usuarios", "Las contraseñas no coinciden.")
-            return
-        role = self.role.get()
-        data["role"] = role
-        data["group"] = "Contabilidad" if role == "accounting_admin" else "Comercial"
-        self.result = data
-        self.destroy()
-
-
-class _PasswordDialog(Toplevel):
-    def __init__(self, master: Tk) -> None:
-        super().__init__(master)
-        self.title("Cambiar contraseña")
-        self.resizable(False, False)
-        self.result: str | None = None
-        self.password = StringVar()
-        self.password2 = StringVar()
-
-        body = ttk.Frame(self, padding=14)
-        body.grid(sticky="nsew")
-        ttk.Label(body, text="Nueva contraseña").grid(row=0, column=0, sticky="w", pady=4)
-        ttk.Entry(body, textvariable=self.password, show="*", width=34).grid(row=0, column=1, pady=4)
-        ttk.Label(body, text="Confirmar contraseña").grid(row=1, column=0, sticky="w", pady=4)
-        ttk.Entry(body, textvariable=self.password2, show="*", width=34).grid(row=1, column=1, pady=4)
-        buttons = ttk.Frame(body)
-        buttons.grid(row=2, column=0, columnspan=2, sticky="e", pady=(12, 0))
-        ttk.Button(buttons, text="Cancelar", command=self.destroy).pack(side="right", padx=(8, 0))
-        ttk.Button(buttons, text="Guardar", command=self._accept).pack(side="right")
-        self.grab_set()
-
-    def _accept(self) -> None:
-        if not self.password.get():
-            Dialogs.error("Usuarios", "Digite la nueva contraseña.")
-            return
-        if self.password.get() != self.password2.get():
-            Dialogs.error("Usuarios", "Las contraseñas no coinciden.")
-            return
-        self.result = self.password.get()
-        self.destroy()

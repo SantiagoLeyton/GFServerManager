@@ -17,6 +17,24 @@ def python_executable(venv: Path) -> Path:
     return venv / "Scripts" / "python.exe"
 
 
+def project_python_executable(project_path: Path) -> Path:
+    return python_executable(venv_path(project_path))
+
+
+def require_project_python(project_path: Path) -> Path:
+    python = project_python_executable(project_path)
+    if not python.exists():
+        raise RuntimeError(f"No se encontró el entorno virtual de Gestión Fiduciaria:\n{python}")
+    return python
+
+
+def require_python_executable(venv: Path) -> Path:
+    python = python_executable(venv)
+    if not python.exists():
+        raise RuntimeError(f"No se encontró el entorno virtual de Gestión Fiduciaria:\n{python}")
+    return python
+
+
 def ensure_virtualenv(project_path: Path) -> Path:
     venv = venv_path(project_path)
     executable = python_executable(venv)
@@ -27,25 +45,25 @@ def ensure_virtualenv(project_path: Path) -> Path:
 
 
 def install_dependencies(project_path: Path, venv: Path) -> None:
-    python = python_executable(venv)
+    python = require_project_python(project_path)
     _run([str(python), "-m", "pip", "install", "--upgrade", "pip"], project_path)
     _run([str(python), "-m", "pip", "install", "-r", "requirements.txt"], project_path)
     _run([str(python), "-m", "pip", "install", "waitress"], project_path)
 
 
 def migrate(project_path: Path, venv: Path) -> None:
-    _run([str(python_executable(venv)), "manage.py", "migrate", "--noinput"], project_path)
+    _run([str(require_project_python(project_path)), "manage.py", "migrate", "--noinput"], project_path)
 
 
 def collectstatic(project_path: Path, venv: Path) -> None:
     _run(
-        [str(python_executable(venv)), "manage.py", "collectstatic", "--noinput"],
+        [str(require_project_python(project_path)), "manage.py", "collectstatic", "--noinput"],
         project_path,
     )
 
 def django_shell(project_path: Path, venv: Path, code: str, input_text: str | None = None) -> subprocess.CompletedProcess:
     return run_hidden(
-        [str(python_executable(venv)), "manage.py", "shell", "-c", code],
+        [str(require_project_python(project_path)), "manage.py", "shell", "-c", code],
         cwd=project_path,
         input=input_text,
         check=True,

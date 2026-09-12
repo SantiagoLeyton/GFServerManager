@@ -67,8 +67,36 @@ def env_database_credentials(project_path: Path) -> DatabaseCredentials:
 
 def is_env_valid(project_path: Path) -> bool:
     values = read_env(project_path)
-    required = ["DJANGO_SECRET_KEY", "DJANGO_DEBUG", "DJANGO_ALLOWED_HOSTS", "DB_NAME", "DB_USER", "DB_HOST", "DB_PORT"]
-    return all(values.get(key) for key in required)
+    required = [
+        "DJANGO_SECRET_KEY",
+        "DJANGO_DEBUG",
+        "DJANGO_ALLOWED_HOSTS",
+        "DB_NAME",
+        "DB_USER",
+        "DB_HOST",
+        "DB_PORT",
+        "BACKUP_STORAGE_PATH",
+        "BACKUP_PG_DUMP_PATH",
+        "BACKUP_PG_RESTORE_PATH",
+        "EMAIL_BACKEND",
+        "EMAIL_HOST",
+        "EMAIL_PORT",
+        "EMAIL_HOST_USER",
+        "EMAIL_HOST_PASSWORD",
+        "EMAIL_USE_TLS",
+        "EMAIL_USE_SSL",
+        "DEFAULT_FROM_EMAIL",
+        "SERVER_EMAIL",
+        "GOOGLE_DRIVE_BACKUP_ENABLED",
+        "GOOGLE_DRIVE_BACKUP_FOLDER_NAME",
+        "GOOGLE_DRIVE_TIMEOUT_SECONDS",
+    ]
+    if not all(values.get(key) for key in required):
+        return False
+    drive_enabled = values.get("GOOGLE_DRIVE_BACKUP_ENABLED", "").lower() in {"1", "true", "yes", "on"}
+    if drive_enabled:
+        return bool(values.get("GOOGLE_DRIVE_TOKEN_FILE") and values.get("GOOGLE_DRIVE_BACKUP_FOLDER_ID"))
+    return True
 
 
 def write_env(project_path: Path, values: dict[str, str], backup_existing: bool) -> EnvWriteResult:
@@ -88,6 +116,49 @@ def write_env(project_path: Path, values: dict[str, str], backup_existing: bool)
         backup_path=backup_path,
         allowed_hosts=values["DJANGO_ALLOWED_HOSTS"].split(","),
         csrf_trusted_origins=values["DJANGO_CSRF_TRUSTED_ORIGINS"].split(","),
+    )
+
+
+def update_env(project_path: Path, updates: dict[str, str], backup_existing: bool = True) -> EnvWriteResult:
+    env_path = project_path / ".env"
+    backup_path = None
+    if env_path.exists() and backup_existing:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = project_path / f".env.backup_{timestamp}"
+        shutil.copy2(env_path, backup_path)
+
+    existing_lines = env_path.read_text(encoding="utf-8", errors="replace").splitlines() if env_path.exists() else []
+    pending = {key: str(value) for key, value in updates.items()}
+    output: list[str] = []
+    seen: set[str] = set()
+    for raw_line in existing_lines:
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in raw_line:
+            output.append(raw_line)
+            continue
+        key, _value = raw_line.split("=", 1)
+        clean_key = key.strip()
+        if clean_key in pending:
+            if clean_key not in seen:
+                output.append(f"{clean_key}={_format_env_value(pending[clean_key])}")
+                seen.add(clean_key)
+            continue
+        output.append(raw_line)
+    for key, value in pending.items():
+        if key not in seen:
+            output.append(f"{key}={_format_env_value(value)}")
+
+    env_path.write_text("\n".join(output) + "\n", encoding="utf-8")
+    merged = read_env(project_path)
+    return EnvWriteResult(
+        path=env_path,
+        backup_path=backup_path,
+        allowed_hosts=merged.get("DJANGO_ALLOWED_HOSTS", "").split(",") if merged.get("DJANGO_ALLOWED_HOSTS") else [],
+        csrf_trusted_origins=(
+            merged.get("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",")
+            if merged.get("DJANGO_CSRF_TRUSTED_ORIGINS")
+            else []
+        ),
     )
 
 

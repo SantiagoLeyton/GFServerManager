@@ -15,6 +15,10 @@ if (ROOT / "assets").exists():
 
 hiddenimports = (
     collect_submodules("psycopg2")
+    + collect_submodules("google")
+    + collect_submodules("google_auth_oauthlib")
+    + collect_submodules("googleapiclient")
+    + collect_submodules("httplib2")
     + [
         "psutil",
         "waitress",

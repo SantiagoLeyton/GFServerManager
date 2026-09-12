@@ -26,6 +26,10 @@ logs/
 # Local secrets/configuration
 .env
 .env.*
+credentials.json
+token.json
+client_secret*.json
+*oauth*.json
 
 # Editor/OS noise
 .idea/
